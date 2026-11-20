@@ -547,18 +547,21 @@ test_sb_env_exec_down() {
 test_sb_panel() {
   sb_setup panel
   as X capacity supabase 3 >/dev/null
-  ( cd "$PROJ" && H=A sbx up >/dev/null 2>&1 )         # slot 0 held + running
+  ( cd "$PROJ" && LEASE_LABEL=agentA H=A sbx up >/dev/null 2>&1 )   # slot 0 held + running
   printf 'myapp\t/w/exp-main\nold_lease2\t/w/old\n' >> "$FAKE/running"   # unmanaged + warm free slot
   LEASE_HOLDER=Z LEASE_PID=0 LEASE_LABEL=Z "$LEASE" acquire supabase >/dev/null   # slot 1, no stack
   : > "$FAKE/calls"
   local o; o=$("$LSB" panel)
   has "$o" "SUPABASE STACKS"
-  has "$o" "toy_lease0"; has "$o" "slot 0 · held by proj-panel"
+  has "$o" "toy_lease0"; has "$o" "slot 0 · held by agentA"
   has "$o" "myapp"; has "$o" "unmanaged (no lease)"
   has "$o" "slot 2 · free (warm"
   has "$o" "(slot 1)"; has "$o" "held by Z but no stack running"
   # panel never stops anything
   eq "$(grep -cv '^docker ps ' "$FAKE/calls")" 0 "panel only runs docker ps"
+  # CLI without the workdir label: worktree comes from the slot meta
+  perl -pi -e 's/^(toy_lease0)\t.*/$1\t/' "$FAKE/running"
+  eq "$("$LSB" panel | grep toy_lease0 | awk "{print \$NF}")" "proj-panel" "workdir fallback"
   # wired into lease top through LEASE_TOP_PANELS
   has "$(LEASE_TOP_PANELS="$LSB" "$LEASE" top --once)" "unmanaged (no lease)"
 }

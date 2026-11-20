@@ -398,7 +398,9 @@ cmd_panel() {
   local srows=''
   [ -n "$slots" ] && [ "$slots" != '[]' ] && srows=$(sqlite3 :memory: \
     "SELECT json_extract(value,'\$.slot'), json_extract(value,'\$.state'),
-            IFNULL(json_extract(value,'\$.label'), IFNULL(json_extract(value,'\$.holder'),''))
+            IFNULL(json_extract(value,'\$.label'), IFNULL(json_extract(value,'\$.holder'),'')),
+            IFNULL(json_extract(json_extract(value,'\$.slot_meta'),'\$.project_id'),''),
+            IFNULL(json_extract(json_extract(value,'\$.slot_meta'),'\$.worktree'),'')
      FROM json_each($(sqlq "$slots"));" 2>/dev/null | tr '|' '\t')
   [ $rc -ne 0 ] && [ -z "$srows" ] && return 1        # nothing to say
   echo "SUPABASE STACKS (docker)"
@@ -413,6 +415,9 @@ cmd_panel() {
         k=${proj##*_lease}; seen="$seen$k "
         st=$(printf '%s\n' "$srows" | awk -F'\t' -v k="$k" '$1==k{print $2 "\t" $3; exit}')
         who=${st#*	}; st=${st%%	*}
+        # older CLIs don't label containers with their workdir: use what
+        # `lease-supabase up` recorded for the slot
+        [ -n "$wd" ] || wd=$(printf '%s\n' "$srows" | awk -F'\t' -v k="$k" -v p="$proj" '$1==k && $4==p{print $5; exit}')
         case "$st" in
           held) note="slot $k · held by $who";;
           expired|dead) note="slot $k · ⚠ lease $st (was $who)";;
@@ -425,7 +430,7 @@ cmd_panel() {
   done <<EOF
 $projs
 EOF
-  while IFS=$'\t' read -r k st who; do
+  while IFS=$'\t' read -r k st who _; do
     [ "$st" = held ] || continue
     case "$seen" in *" $k "*) continue;; esac
     printf '  %-28s %s\n' "(slot $k)" "⚠ held by $who but no stack running (starting? or not using it)"
