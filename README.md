@@ -161,7 +161,7 @@ lease capacity <res> [<N>]
 lease resource-meta <res> [--set JSON]   (config compartida del recurso, p. ej. puertos de lease-supabase)
 lease log [<res>] [-n 50]
 lease whoami
-lease top [--interval 2s] [--once] [-n N]
+lease top [--interval 2s] [--once] [-n N] [--no-banner]
 ```
 
 - `token` es opcional en `renew`/`release`/`hold`/`meta`: si no lo pasas se usa el lease del holder actual. Cada Bash tool call es un shell nuevo, así que los agentes no tienen que guardarlo. Si lo pasas, se valida (fencing).

@@ -257,7 +257,7 @@ usage:
   lease resource-meta <res> [--set JSON]  shared config of a resource (merged)
   lease log [<res>] [-n 50]              history
   lease whoami                           holder id + owner pid and how they were found
-  lease top [--interval 2s] [--once] [-n N]
+  lease top [--interval 2s] [--once] [-n N] [--no-banner]
                                          live read-only view: slots, panels
                                          (lease-* panel), recent activity
 
@@ -815,7 +815,14 @@ top_frame() { # <log lines> <width>: prints one frame
     B=$'\033[1m' D=$'\033[2m' R=$'\033[0m' G=$'\033[32m' Y=$'\033[33m' RED=$'\033[31m' C=$'\033[36m'
   fi
   local rule; rule=$(printf '%*s' "$width" '' | tr ' ' '-')
-  printf '%slease top%s · %s · db %s\n' "$B" "$R" "$(date '+%H:%M:%S')" "$DB"
+  if [ "${TOP_BANNER:-1}" = 1 ]; then
+    printf '%s%s%s\n' "$C$B" ' _' "$R"
+    printf '%s%s%s\n' "$C$B" '| |   ___ __ _ ___ ___' "$R"
+    printf '%s%s%s   %stop · %s%s\n' "$C$B" '| |__/ -_) _` (_-</ -_)' "$R" "$D" "$(date '+%H:%M:%S')" "$R"
+    printf '%s%s%s   %s%s%s\n' "$C$B" '|____\___\__,_/__/\___|' "$R" "$D" "$DB" "$R"
+  else
+    printf '%slease top%s · %s · db %s\n' "$B" "$R" "$(date '+%H:%M:%S')" "$DB"
+  fi
   echo "$D$rule$R"
   if [ ! -s "$DB" ]; then
     echo "(no leases yet)"
@@ -889,18 +896,19 @@ SQL
 }
 
 cmd_top() {
-  local interval=2 once=0 nlog=''
+  local interval=2 once=0 nlog='' banner=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --interval|-i) interval=$(parse_dur "${2-}") || die "bad --interval"; shift 2;;
       --once|-1) once=1; shift;;
       -n) nlog=${2-}; shift 2;;
-      *) die "usage: lease top [--interval 2s] [--once] [-n LOG_LINES]";;
+      --no-banner) banner=0; shift;;
+      *) die "usage: lease top [--interval 2s] [--once] [-n LOG_LINES] [--no-banner]";;
     esac
   done
   [ "$interval" -ge 1 ] 2>/dev/null || interval=1
   [ -z "$nlog" ] || is_uint "$nlog" || die "-n must be a number"
-  TOP_COLOR=0
+  TOP_COLOR=0 TOP_BANNER=$banner
   [ -t 1 ] && [ -z "${NO_COLOR-}" ] && TOP_COLOR=1
   if [ "$once" = 1 ] || [ ! -t 1 ]; then
     top_frame "${nlog:-10}" "${COLUMNS:-100}"
@@ -913,6 +921,7 @@ cmd_top() {
   while :; do
     rows=$(tput lines 2>/dev/null || echo 40); cols=$(tput cols 2>/dev/null || echo 100)
     n=${nlog:-$(( rows / 3 ))}
+    TOP_BANNER=$banner; [ "$rows" -lt 24 ] && TOP_BANNER=0   # small terminal: one-line header
     frame=$(top_frame "$n" "$cols")
     printf '\033[H\033[2J%s\n%s' "$frame" "$(printf '\033[2mrefresh %ss · q to quit\033[0m' "$interval")"
     key=''

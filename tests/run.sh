@@ -344,6 +344,8 @@ test_top() {
   sleep 2
   local o; o=$(LEASE_TOP_PANELS= "$LEASE" top --once)
   has "$o" "RESOURCE"; has "$o" "Repo@feature-x"
+  has "$o" "|____\\___\\__,_/__/\\___|" "banner"
+  case "$(LEASE_TOP_PANELS= "$LEASE" top --once --no-banner)" in *"|____"*) bad "--no-banner";; esac
   has "$o" "expired: anyone can take it"
   has "$o" "RECENT ACTIVITY"; has "$o" "acquire  db#0"
   case "$o" in *orca:pane-1*) bad "log must show the label, not the holder id";; esac
