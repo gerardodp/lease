@@ -470,6 +470,17 @@ test_sb_refuses_foreign_stack_on_ports() {
   eq "$(rc as A token supabase)" 3 "lease released after failure"
 }
 
+test_sb_never_writes_to_the_repo() {
+  sb_setup clean
+  ( cd "$PROJ" && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm init )
+  local before; before=$(shasum "$PROJ/supabase/config.toml")
+  sbx up >/dev/null 2>&1; sbx env >/dev/null; sbx env --dotenv >/dev/null
+  sbx exec -- true; sbx status >/dev/null; sbx down --stop >/dev/null
+  H=B sbx up --reset >/dev/null 2>&1; H=B sbx down --purge >/dev/null
+  eq "$(shasum "$PROJ/supabase/config.toml")" "$before" "config.toml untouched"
+  eq "$(cd "$PROJ" && git status --porcelain)" "" "no changes in the worktree"
+}
+
 test_sb_handoff_stops_only_its_slot() {
   sb_setup handoff
   printf 'toy_lease0\t/other/worktree\ntoy_lease1\t/x\nunrelated\t/y\nother_lease0\t/z\n' > "$FAKE/running"
