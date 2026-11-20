@@ -78,9 +78,9 @@ test_idempotent_same_holder() {
 
 test_ttl_expiry_and_steal() {
   local told tnew
-  told=$(as A acquire db --ttl 1s | cut -d' ' -f1)
+  told=$(as A acquire db --ttl 3s | cut -d' ' -f1)
   eq "$(rc as B acquire db)" 2 "busy before expiry"
-  sleep 2
+  sleep 5
   has "$(as A ls)" "expired" "ls shows expired"
   tnew=$(as B acquire db | cut -d' ' -f1); eq $? 0 "steal after ttl"
   [ "$tnew" != "$told" ] || bad "steal must mint a new token"

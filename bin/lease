@@ -275,10 +275,10 @@ BEGIN IMMEDIATE;
 INSERT OR IGNORE INTO resources(name, capacity) VALUES ($(sq "$res"), 1);
 CREATE TEMP TABLE reaped AS
   SELECT resource, slot, holder, pid, token,
-         CASE WHEN expires_at <= $t THEN 'ttl' ELSE 'pid' END AS why
+         CASE WHEN expires_at < $t THEN 'ttl' ELSE 'pid' END AS why
   FROM leases
   WHERE resource = $(sq "$res") AND holder <> $(sq "$HOLDER")
-    AND (expires_at <= $t OR token IN $dead);
+    AND (expires_at < $t OR token IN $dead);
 DELETE FROM leases WHERE token IN (SELECT token FROM reaped);
 CREATE TEMP TABLE st AS SELECT EXISTS(
   SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER")) AS mine;
@@ -330,7 +330,7 @@ EOF
   if [ "$ACQ_STATUS" = busy ]; then
     ACQ_BUSY=$(sql <<SQL
 SELECT 'slot ' || slot || ': ' || IFNULL(label, holder) || ' (' || holder || '), '
-       || CASE WHEN expires_at > $t THEN (expires_at - $t) || 's left' ELSE 'expired' END
+       || CASE WHEN expires_at >= $t THEN (expires_at - $t) || 's left' ELSE 'expired' END
   FROM leases WHERE resource = $(sq "$res") ORDER BY slot;
 SQL
 )
@@ -672,7 +672,7 @@ WITH RECURSIVE
 SELECT r.name AS resource, s.k AS slot, r.capacity AS capacity,
        CASE WHEN l.token IS NULL THEN 'free'
             WHEN l.token IN $dead THEN 'dead'
-            WHEN l.expires_at <= $t THEN 'expired'
+            WHEN l.expires_at < $t THEN 'expired'
             ELSE 'held' END AS state,
        l.holder AS holder, l.label AS label, l.pid AS pid,
        l.acquired_at AS acquired_at, l.expires_at AS expires_at,
