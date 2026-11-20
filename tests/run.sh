@@ -34,7 +34,7 @@ run_test() {
   [ -n "$FILTER" ] && case "$name" in *"$FILTER"*) ;; *) return;; esac
   export LEASE_DB="$TMP/$name.db"
   CUR_FAILED=0
-  ( set +e; "test_$name" ) > "$TMP/$name.out" 2>&1
+  ( set +e; "test_$name"; exit 0 ) > "$TMP/$name.out" 2>&1
   local r=$?
   if [ $r -eq 0 ] && ! grep -q '✗' "$TMP/$name.out"; then
     pass=$((pass+1)); echo "ok   $name"
@@ -335,6 +335,165 @@ test_usage_errors() {
   eq "$(rc as A token db)" 3 "token without lease"
   as A acquire db >/dev/null; eq "$(as A token db | cut -d' ' -f2)" 0 "token prints slot"
   has "$(as A acquire "it's" 2>&1)" "invalid resource name"
+}
+
+# ------------------------------------------------- lease-supabase (stubbed) ---
+# docker / lsof / supabase are replaced by stubs that record every call, so
+# these tests never touch real containers.
+LSB="$ROOT/bin/lease-supabase"
+
+sb_setup() {
+  FAKE="$TMP/fake-$1"; export FAKE
+  mkdir -p "$FAKE/bin"; : > "$FAKE/calls"; : > "$FAKE/running"; : > "$FAKE/busy"; : > "$FAKE/published"
+  cat > "$FAKE/bin/docker" <<'STUB'
+#!/bin/bash
+echo "docker $*" >> "$FAKE/calls"
+case "$1" in
+  info|network) exit 0;;
+  volume) [ -f "$FAKE/vol_$3" ]; exit $?;;
+  ps) case "$*" in
+        *publish=*) a="$*"; p=${a##*publish=}; p=${p%% *}; awk -v p="$p" '$1==p{ $1=""; sub(/^ /,""); print }' "$FAKE/published";;
+        *) cat "$FAKE/running";;
+      esac;;
+esac
+exit 0
+STUB
+  cat > "$FAKE/bin/lsof" <<'STUB'
+#!/bin/bash
+p=$(printf '%s\n' "$@" | sed -n 's/^-iTCP:\([0-9]*\)$/\1/p')
+grep -qx "$p" "$FAKE/busy"
+STUB
+  cat > "$FAKE/bin/supabase" <<'STUB'
+#!/bin/bash
+echo "supabase $* | pid=${SUPABASE_PROJECT_ID-} api=${SUPABASE_API_PORT-} db=${SUPABASE_DB_PORT-} net=${SUPABASE_NETWORK_ID-} cwd=$PWD" >> "$FAKE/calls"
+case "$1" in
+  start)  printf '%s\t%s\n' "$SUPABASE_PROJECT_ID" "$PWD" >> "$FAKE/running"; touch "$FAKE/vol_supabase_db_$SUPABASE_PROJECT_ID";;
+  stop)   grep -v "^$3	" "$FAKE/running" > "$FAKE/r.tmp"; mv "$FAKE/r.tmp" "$FAKE/running";;
+  status) echo "API_URL=\"http://127.0.0.1:$SUPABASE_API_PORT\""; echo 'ANON_KEY="k e y"';;
+esac
+exit 0
+STUB
+  chmod +x "$FAKE/bin/"*
+  export PATH="$FAKE/bin:$PATH" LEASE_SUPABASE_BIN="$FAKE/bin/supabase"
+  # a toy project (custom ports, legacy [inbucket] section)
+  mkdir -p "$TMP/proj-$1/supabase/migrations"; PROJ=$(cd "$TMP/proj-$1" && pwd -P)
+  cat > "$PROJ/supabase/config.toml" <<'TOML'
+project_id = "toy"   # comment
+[api]
+port = 60000
+[db]
+port = 60001
+shadow_port = 60002
+[db.pooler]
+enabled = false
+[studio]
+port = 60003
+[inbucket]
+port = 60004
+# smtp_port = 60005
+[analytics]
+port = 60007
+TOML
+  echo 'create table a(id int);' > "$PROJ/supabase/migrations/001_a.sql"
+}
+sbx() { ( cd "${SBDIR:-$PROJ}" && LEASE_HOLDER=${H:-A} LEASE_PID=0 "$LSB" "$@" ); }
+
+test_sb_ports() {
+  sb_setup ports
+  local p; p=$(sbx ports 2)
+  has "$p" "SUPABASE_PROJECT_ID=toy_lease2"
+  has "$p" "SUPABASE_API_PORT=60200"; has "$p" "SUPABASE_DB_PORT=60201"
+  has "$p" "SUPABASE_DB_SHADOW_PORT=60202"; has "$p" "SUPABASE_DB_POOLER_PORT=54529"
+  has "$p" "SUPABASE_STUDIO_PORT=60203"
+  has "$p" "SUPABASE_LOCAL_SMTP_PORT=60204"; has "$p" "SUPABASE_INBUCKET_PORT=60204"
+  has "$p" "SUPABASE_ANALYTICS_PORT=60207"; has "$p" "SUPABASE_EDGE_RUNTIME_INSPECTOR_PORT=8283"
+  has "$p" "SUPABASE_NETWORK_ID=lease-supabase"
+  case "$p" in *SMTP_SMTP_PORT=*|*INBUCKET_SMTP_PORT=*) bad "commented smtp_port must not be offset";; esac
+  p=$(LEASE_SUPABASE_PORT_STEP=10 LEASE_SUPABASE_SLOT_OFFSET=1 sbx ports 0)
+  has "$p" "SUPABASE_API_PORT=60010"
+  p=$(LEASE_SUPABASE_NETWORK= sbx ports 0); case "$p" in *NETWORK*) bad "network disabled";; esac
+}
+
+test_sb_refuses_foreign_stack_on_ports() {
+  sb_setup foreign
+  echo 60000 > "$FAKE/busy"; echo '60000 supabase_kong_other (other)' > "$FAKE/published"
+  printf 'other\t/somewhere\n' > "$FAKE/running"
+  local err; err=$(sbx up 2>&1); eq $? 1 "up fails"
+  has "$err" "not touching it"; has "$err" "supabase_kong_other"
+  grep -q 'supabase stop' "$FAKE/calls" && bad "must never stop a foreign stack"
+  grep -q 'supabase start' "$FAKE/calls" && bad "must not start"
+  eq "$(rc as A token supabase)" 3 "lease released after failure"
+}
+
+test_sb_handoff_stops_only_its_slot() {
+  sb_setup handoff
+  printf 'toy_lease0\t/other/worktree\ntoy_lease1\t/x\nunrelated\t/y\nother_lease0\t/z\n' > "$FAKE/running"
+  local out; out=$(sbx up 2>&1); eq $? 0 "up rc"; has "$out" "slot=0 project_id=toy_lease0"
+  grep -q 'supabase stop --project-id toy_lease0 ' "$FAKE/calls" || bad "previous stack of slot 0 not stopped"
+  # other_lease0 = another repo on the SAME slot: one stack per slot, so it must go too
+  grep -q 'supabase stop --project-id other_lease0 ' "$FAKE/calls" || bad "other repo on same slot not stopped"
+  grep -E 'supabase stop --project-id (toy_lease1|unrelated) ' "$FAKE/calls" && bad "stopped a stack of another slot or an unmanaged one"
+  grep -q "supabase start | pid=toy_lease0 api=60000 db=60001 net=lease-supabase cwd=$PROJ" "$FAKE/calls" ||
+    { bad "start not called with slot env"; cat "$FAKE/calls"; }
+  has "$(as A ls supabase)" "held"
+  # second up from the same worktree reuses the running stack
+  : > "$FAKE/calls"
+  out=$(sbx up 2>&1); has "$out" "reusing it"
+  grep -qE 'supabase (start|stop)' "$FAKE/calls" && bad "reuse must not restart"
+}
+
+test_sb_migration_drift() {
+  sb_setup drift
+  sbx up >/dev/null 2>&1                       # fresh volumes: no reset
+  grep -q 'supabase db reset' "$FAKE/calls" && bad "fresh start must not reset"
+  sbx down >/dev/null
+  # another worktree of the repo with one more migration
+  local WT2="$TMP/wt2-drift"; cp -R "$PROJ" "$WT2"; WT2=$(cd "$WT2" && pwd -P)
+  echo 'create table b(id int);' > "$WT2/supabase/migrations/002_b.sql"
+  : > "$FAKE/calls"
+  local out; out=$(SBDIR=$WT2 H=B sbx up 2>&1); eq $? 0 "wt2 up"
+  has "$out" "→ supabase db reset"
+  grep -q 'supabase stop --project-id toy_lease0' "$FAKE/calls" || bad "wt1 stack not stopped"
+  grep -q "supabase db reset | pid=toy_lease0" "$FAKE/calls" || bad "reset not run in slot env"
+  SBDIR=$WT2 H=B sbx down >/dev/null
+  # back to wt1 with --no-reset: only a warning
+  : > "$FAKE/calls"
+  out=$(sbx up --no-reset 2>&1); has "$out" "WARNING"
+  grep -q 'db reset' "$FAKE/calls" && bad "--no-reset must not reset"
+  # same worktree adds a migration: suggest migration up, no reset
+  sbx down >/dev/null
+  echo 'create table c(id int);' > "$PROJ/supabase/migrations/003_c.sql"
+  printf 'toy_lease0\t%s\n' "$PROJ" > "$FAKE/running"
+  : > "$FAKE/calls"
+  out=$(sbx up 2>&1)
+  # the DB is still wt2's (no reset happened): drift from another worktree -> auto reset
+  has "$out" "→ supabase db reset"; sbx down >/dev/null
+  # now record wt1 properly, then change a migration in wt1 only
+  sbx up --reset >/dev/null 2>&1; sbx down >/dev/null
+  echo 'create table d(id int);' > "$PROJ/supabase/migrations/004_d.sql"
+  : > "$FAKE/calls"
+  out=$(sbx up 2>&1); has "$out" "supabase migration up"
+  grep -q 'db reset' "$FAKE/calls" && bad "own new migration must not trigger reset"
+}
+
+test_sb_env_exec_down() {
+  sb_setup env
+  eq "$(rc sbx env)" 3 "env without lease -> 3"
+  eq "$(rc sbx exec -- true)" 3 "exec without lease -> 3"
+  sbx up >/dev/null 2>&1
+  local e; e=$(sbx env)
+  has "$e" "export SUPABASE_PROJECT_ID=toy_lease0"; has "$e" "export API_URL=http://127.0.0.1:60000"
+  has "$e" 'export ANON_KEY=k\ e\ y'
+  has "$(sbx env --dotenv)" 'ANON_KEY="k e y"'
+  eq "$(sqlite3 :memory: "SELECT json_extract('$(sbx env --json)', '\$.API_URL')")" "http://127.0.0.1:60000" "json"
+  eq "$(sbx exec -- sh -c 'echo $SUPABASE_PROJECT_ID $SUPABASE_DB_PORT $API_URL')" "toy_lease0 60001 http://127.0.0.1:60000" "exec env"
+  sbx exec -- supabase migration up >/dev/null
+  grep -q 'supabase migration up | pid=toy_lease0' "$FAKE/calls" || bad "bare supabase resolves to project CLI with env"
+  : > "$FAKE/calls"
+  sbx down --stop >/dev/null
+  grep -q 'supabase stop --project-id toy_lease0' "$FAKE/calls" || bad "down --stop"
+  eq "$(rc as A token supabase)" 3 "released"
+  eq "$(rc sbx down)" 3 "down without lease -> 3"
 }
 
 # ------------------------------------------------------------------- main ---
