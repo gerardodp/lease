@@ -547,8 +547,8 @@ cmd_hold() {
   fi
   local rc=0
   while kill -0 "$pid" 2>/dev/null; do
-    if ! "$0" renew "$res" "$tok" -q 2>/dev/null; then
-      rc=$?
+    "$0" renew "$res" "$tok" -q 2>/dev/null; rc=$?
+    if [ "$rc" != 0 ]; then
       if [ "$rc" = "$EX_LOST" ]; then
         echo "LOST $res while holding it — stopping" >&2
         [ -n "$child" ] && kill "$child" 2>/dev/null
@@ -692,11 +692,12 @@ SQL
     local o; o=$(sqlite3 -json -cmd ".timeout $BUSY_TIMEOUT_MS" "$DB" "$q;") || die "database error"
     echo "${o:-[]}"; return
   fi
-  local rows; rows=$(sql <<<"$q;") || die "database error"
+  local US=$(printf '\037')
+  local rows; rows=$(sql -separator "$US" <<<"$q;") || die "database error"
   [ -z "$rows" ] && { echo "(nothing)"; return; }
   printf '%-14s %4s %-8s %-28s %7s %-9s %-9s %s\n' RESOURCE SLOT STATE HOLDER PID SINCE LEFT META
   local name slot cap state holder label pid acq exp left meta smeta
-  while IFS=$'\t' read -r name slot cap state holder label pid acq exp left meta smeta; do
+  while IFS="$US" read -r name slot cap state holder label pid acq exp left meta smeta; do
     local who='-' since='-' l='-' m=''
     if [ "$state" != free ]; then
       who=${label:-$holder}
