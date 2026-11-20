@@ -164,7 +164,8 @@ lease-supabase — local Supabase stacks in leased slots (one stack per slot)
 usage:
   lease-supabase up [--wait] [--timeout 30m] [--ttl 15m] [--reset | --no-reset]
                     [-x svc,svc]        acquire a slot, (re)start this worktree's stack in it
-  lease-supabase down [--stop]          release the slot (stack keeps running unless --stop)
+  lease-supabase down [--stop|--purge]  release the slot (stack keeps running unless --stop;
+                                        --purge also deletes its volumes)
   lease-supabase status                 slots, who holds them, what runs where
   lease-supabase env [--dotenv|--json]  env for the slot you hold (overrides + URLs/keys)
   lease-supabase exec -- <cmd...>       run cmd with the slot env (e.g. supabase db reset,
@@ -298,10 +299,11 @@ hint: stop it yourself if it is yours, or shift slots with LEASE_SUPABASE_SLOT_O
 }
 
 cmd_down() {
-  local stop=0
+  local stop=0 purge=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --stop) stop=1; shift;;
+      --purge) stop=1; purge=1; shift;;
       --keep-running) stop=0; shift;;
       *) die "unknown option $1";;
     esac
@@ -310,8 +312,9 @@ cmd_down() {
   local slot; slot=$(my_slot) || die "you hold no $RES lease" "$EX_LOST"
   if [ "$stop" = 1 ]; then
     local pid; pid=$(slot_project "$slot")
-    say "stopping $pid (volumes kept)"
-    ( cd /tmp && "$SB" stop --project-id "$pid" ) >/dev/null 2>&1 || say "warning: stop failed"
+    local extra=(); [ "$purge" = 1 ] && extra=(--no-backup)
+    say "stopping $pid ($([ "$purge" = 1 ] && echo "volumes DELETED" || echo "volumes kept"))"
+    ( cd /tmp && "$SB" stop --project-id "$pid" ${extra[@]+"${extra[@]}"} ) >/dev/null 2>&1 || say "warning: stop failed"
   fi
   "$LEASE" release "$RES"
 }

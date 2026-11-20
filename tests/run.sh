@@ -492,6 +492,9 @@ test_sb_env_exec_down() {
   : > "$FAKE/calls"
   sbx down --stop >/dev/null
   grep -q 'supabase stop --project-id toy_lease0' "$FAKE/calls" || bad "down --stop"
+  grep -q -- '--no-backup' "$FAKE/calls" && bad "--stop must keep volumes"
+  sbx up >/dev/null 2>&1; : > "$FAKE/calls"; sbx down --purge >/dev/null
+  grep -q 'supabase stop --project-id toy_lease0 --no-backup' "$FAKE/calls" || bad "down --purge deletes volumes"
   eq "$(rc as A token supabase)" 3 "released"
   eq "$(rc sbx down)" 3 "down without lease -> 3"
 }
