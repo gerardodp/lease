@@ -25,7 +25,9 @@ SQLite at ~/.local/state/lease). Rules:
   stack, which is not yours.
 - **When done** with Supabase: `lease-supabase down` (keeps the stack running for a
   warm restart; `--stop` to free RAM). Don't sit on a slot while doing unrelated work.
-- Your leases are renewed automatically by a hook on every tool call. If you go
+- Acquire leases on demand, only when you actually need the resource (at any point in
+  the session), and release them when done. Your leases are renewed automatically by a
+  hook on every tool call. If you go
   idle >15 min they expire and someone else can take the slot.
 - If you see **"lease: you LOST …"** (hook message) or any `lease` command exits **3**:
   stop using that resource immediately (its stack may now be someone else's) and

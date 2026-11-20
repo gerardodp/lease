@@ -1,5 +1,102 @@
 # lease
 
+## Para empezar (explicado fácil)
+
+### El problema
+
+Tienes varios agentes de Claude trabajando a la vez, cada uno en su worktree.
+En la máquina hay cosas que **no se pueden usar dos a la vez**, sobre todo el
+Supabase local: solo hay un juego de puertos, y si un agente hace
+`supabase db reset` mientras otro está pasando tests, le rompe el trabajo.
+
+### La idea: un semáforo con préstamos que caducan
+
+`lease` es como el **mostrador de préstamo de una biblioteca**:
+
+1. Un agente pide el recurso → `lease acquire supabase`. Si está libre, se lo
+   prestan **por 15 minutos** y le dan un número de préstamo (el *token*).
+2. Si otro agente lo pide mientras tanto → le dicen **"ocupado, lo tiene X"**
+   (exit 2). Puede esperar (`lease wait`) o hacer otra cosa.
+3. Cuando termina, lo devuelve → `lease release supabase`.
+4. ¿Y si se olvida de devolverlo o se cuelga? El préstamo **caduca solo**: a los
+   15 min sin renovar, o en cuanto su sesión de Claude muere. Nadie se queda
+   bloqueado para siempre.
+5. Si a alguien le caducó el préstamo y otro se lo llevó, cuando el primero
+   vuelva le dicen **"lo has perdido"** (LOST, exit 3) para que no siga
+   tocando algo que ya no es suyo.
+
+### ¿Quién renueva el préstamo? El hook (automático)
+
+Para que un agente que **está trabajando** no pierda el préstamo a los 15 min,
+hay un hook de Claude Code que en cada tool call dice "sigo aquí" y renueva
+**los préstamos que ese agente tenga**.
+
+- **No hay que hacer nada al empezar la sesión.** El hook está siempre
+  instalado y, si el agente no tiene nada prestado, no hace nada (una consulta
+  de ~30 ms y fuera).
+- El agente pide el recurso **cuando lo necesita**, a mitad de sesión, las veces
+  que quiera. Desde ese momento el hook lo mantiene vivo; cuando lo devuelve, el
+  hook vuelve a no hacer nada.
+- Si el agente se queda parado (>15 min sin tool calls) o se cierra, el
+  préstamo caduca y otro puede usarlo.
+- Lo único ligado al arranque: Claude lee `settings.json` al iniciar, así que
+  las sesiones que ya estaban abiertas al instalar el hook puede que no lo
+  tengan hasta reiniciarlas. Sin hook, `lease` funciona igual, pero el préstamo
+  caduca a los 15 min aunque estés trabajando (usa `--ttl 2h` o `lease hold`).
+
+### Supabase: un stack por "plaza"
+
+Con `lease-supabase` el recurso tiene **plazas** (slots). Cada plaza es un
+Supabase entero y separado, con sus propios puertos:
+
+| plaza | puertos (API / DB / Studio) | nombre del stack |
+|---|---|---|
+| 0 | 54321 / 54322 / 54323 | `<proyecto>_lease0` |
+| 1 | 54421 / 54422 / 54423 | `<proyecto>_lease1` |
+| k | +k·100 | `<proyecto>_lease<k>` |
+
+Con `lease capacity supabase 2` pueden trabajar dos agentes a la vez, cada uno
+en su plaza. No se toca el `config.toml` del repo.
+
+### El día a día de un agente (5 comandos)
+
+```sh
+lease-supabase up                            # "préstame una plaza" (arranca su Supabase)
+lease-supabase exec -- supabase db reset     # usar SU Supabase (no el de por defecto)
+lease-supabase exec -- pnpm test:integration
+lease-supabase down                          # "ya he terminado" (devuelve la plaza)
+lease ls                                     # ¿quién tiene qué?
+```
+
+`exec` es importante: un `supabase …` a secas apunta al stack por defecto, que
+no es el tuyo. `exec` le pasa los puertos y el nombre de tu plaza.
+
+### Puesta en marcha (una vez)
+
+```sh
+./install.sh                                    # pone lease y lease-supabase en el PATH
+./install.sh --settings ~/.claude/settings.json # instala el hook (ver "Instalación" para Orca)
+lease capacity supabase 2                       # cuántos Supabase a la vez
+```
+
+Y pega [`docs/claude-snippet.md`](docs/claude-snippet.md) en `~/.claude/CLAUDE.md`
+para que los agentes sepan usarlo.
+
+### Palabras raras
+
+- **Lease**: préstamo con fecha de caducidad (no un candado eterno).
+- **TTL**: cuánto dura el préstamo si nadie lo renueva (15 min por defecto).
+- **Token**: número del préstamo. Cada préstamo nuevo tiene uno distinto, así se
+  sabe si el tuyo sigue valiendo.
+- **Holder**: quién tiene el préstamo (tu pestaña de Orca / sesión de Claude).
+- **Slot / plaza**: una de las N copias de un recurso.
+- **Steal**: alguien se queda un préstamo caducado. Es normal y queda registrado
+  en `lease log`.
+
+---
+
+## Referencia
+
 Semáforo de recursos compartidos para agentes en paralelo (worktrees de Orca +
 Claude Code). Leases con TTL y fencing tokens sobre SQLite: sin daemon, sin
 servidor, sin dependencias (bash 3.2 + `sqlite3` + `ps`, todo de serie en macOS).
@@ -156,6 +253,7 @@ encola un aviso `lost` para el holder anterior.
 
 `hooks/lease-heartbeat.sh`, en `PreToolUse` y `PostToolUse` con matcher `*`:
 
+- **No hay que activarlo al empezar la sesión**: corre siempre, y sin leases del agente no hace nada. Los leases se piden a demanda en cualquier momento; desde ese momento el hook los renueva, y al liberarlos vuelve a no hacer nada.
 - Ejecuta `lease renew-mine --hook`: extiende en su propio `ttl` cada lease con el mismo holder **y** el mismo PID dueño. Agente activo = renueva solo; agente parado = caduca; agente muerto = PID muerto.
 - Si un lease de este agente fue recogido por otro, imprime JSON de hook con `additionalContext` (y `systemMessage`), así que **el modelo se entera de que lo perdió**. Probado de punta a punta con un `claude -p` real: el modelo citó el aviso.
 - Siempre exit 0 y en silencio. Sin DB sale al instante. Coste de 30–60 ms por tool call en esta máquina, casi todo arranque de procesos (bash + sqlite3).
