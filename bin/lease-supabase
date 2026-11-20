@@ -1,0 +1,389 @@
+#!/bin/bash
+# lease-supabase — run a local Supabase stack in a leased slot.
+#
+# Each slot k of the `supabase` resource is an independent stack:
+#   project_id = <project_id from config.toml>_lease<k>
+#   ports      = <port from config.toml> + (k + LEASE_SUPABASE_SLOT_OFFSET) * LEASE_SUPABASE_PORT_STEP
+# applied through the Supabase CLI's SUPABASE_* environment overrides, so the
+# project's committed supabase/config.toml is never modified.
+#
+# Never stops a stack that is not the one of the slot it just acquired
+# (project id must end in _lease<k>).
+set -u
+
+EX_OK=0 EX_ERR=1 EX_BUSY=2 EX_LOST=3 EX_TIMEOUT=4 EX_NOTFOUND=5
+prog=lease-supabase
+die() { echo "$prog: $1" >&2; exit "${2:-$EX_ERR}"; }
+say() { echo "$prog: $*" >&2; }
+
+self=$0
+while [ -L "$self" ]; do
+  l=$(readlink "$self"); case "$l" in /*) self=$l;; *) self=$(dirname "$self")/$l;; esac
+done
+LEASE=${LEASE_BIN:-$(cd "$(dirname "$self")" && pwd)/lease}
+[ -x "$LEASE" ] || LEASE=$(command -v lease) || die "lease not found"
+
+RES=${LEASE_SUPABASE_RESOURCE:-supabase}
+STEP=${LEASE_SUPABASE_PORT_STEP:-100}
+OFFSET=${LEASE_SUPABASE_SLOT_OFFSET:-0}
+# Shared docker network for every slot stack ("" = Supabase default per-project
+# network). Sharing avoids exhausting docker's address pools.
+NETWORK=${LEASE_SUPABASE_NETWORK-lease-supabase}
+SUBNET=${LEASE_SUPABASE_SUBNET:-10.213.0.0/24}
+
+# --------------------------------------------------------------- project ---
+
+find_root() {
+  local d=$PWD
+  while [ "$d" != / ]; do
+    [ -f "$d/supabase/config.toml" ] && { echo "$d"; return 0; }
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+load_project() {
+  ROOT=$(find_root) || die "no supabase/config.toml found in $PWD or its parents" "$EX_NOTFOUND"
+  CONFIG="$ROOT/supabase/config.toml"
+  BASE_ID=$(toml_get '' project_id)
+  [ -n "$BASE_ID" ] || BASE_ID=$(basename "$ROOT")
+  BASE_ID=$(printf '%s' "$BASE_ID" | tr -c 'A-Za-z0-9_.-' '_')
+  # Base project id is the *repo* identity: strip a previous _leaseN just in case.
+  BASE_ID=${BASE_ID%_lease[0-9]*}
+  REPO=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null)
+  case "$REPO" in ''|.git) REPO="$ROOT";; *) REPO=$(cd "$ROOT" && cd "$(dirname "$REPO")" && pwd);; esac
+  BRANCH=$(git -C "$ROOT" symbolic-ref --short -q HEAD 2>/dev/null || git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')
+  if [ -n "${LEASE_SUPABASE_BIN-}" ]; then SB=$LEASE_SUPABASE_BIN
+  elif [ -x "$ROOT/node_modules/.bin/supabase" ]; then SB="$ROOT/node_modules/.bin/supabase"
+  else SB=$(command -v supabase) || die "supabase CLI not found (set LEASE_SUPABASE_BIN)"
+  fi
+}
+
+# toml_get <section> <key>: value of key in [section] ('' = top level).
+toml_get() {
+  awk -v want="$1" -v key="$2" '
+    /^[ \t]*\[/ { s=$0; gsub(/^[ \t]*\[|\][ \t]*(#.*)?$/, "", s); sec=s; next }
+    sec == want {
+      line=$0; sub(/#.*/, "", line)
+      if (match(line, "^[ \t]*" key "[ \t]*=")) {
+        v=substr(line, RLENGTH+1); gsub(/^[ \t"]+|[ \t"]+$/, "", v); print v; exit
+      }
+    }' "$CONFIG"
+}
+
+# Port table: "<env var(s)>|<section>|<key>|<default or empty = only if set>"
+PORTS='SUPABASE_API_PORT|api|port|54321
+SUPABASE_DB_PORT|db|port|54322
+SUPABASE_DB_SHADOW_PORT|db|shadow_port|54320
+SUPABASE_DB_POOLER_PORT|db.pooler|port|54329
+SUPABASE_STUDIO_PORT|studio|port|54323
+SUPABASE_LOCAL_SMTP_PORT SUPABASE_INBUCKET_PORT|local_smtp inbucket|port|54324
+SUPABASE_LOCAL_SMTP_SMTP_PORT SUPABASE_INBUCKET_SMTP_PORT|local_smtp inbucket|smtp_port|
+SUPABASE_LOCAL_SMTP_POP3_PORT SUPABASE_INBUCKET_POP3_PORT|local_smtp inbucket|pop3_port|
+SUPABASE_ANALYTICS_PORT|analytics|port|54327
+SUPABASE_EDGE_RUNTIME_INSPECTOR_PORT|edge_runtime|inspector_port|8083'
+
+# slot_env <slot>: prints NAME=VALUE lines (no quoting needed: ids & ints).
+slot_env() {
+  local k=$1 off=$(( ($1 + OFFSET) * STEP )) vars secs key def base s v
+  echo "SUPABASE_PROJECT_ID=${BASE_ID}_lease$k"
+  [ -n "$NETWORK" ] && echo "SUPABASE_NETWORK_ID=$NETWORK"
+  while IFS='|' read -r vars secs key def; do
+    base=''
+    for s in $secs; do base=$(toml_get "$s" "$key"); [ -n "$base" ] && break; done
+    [ -n "$base" ] || base=$def
+    [ -n "$base" ] || continue
+    case "$base" in *[!0-9]*) say "warning: non-numeric $secs.$key=$base in config.toml, skipped"; continue;; esac
+    for v in $vars; do echo "$v=$((base + off))"; done
+  done <<<"$PORTS"
+  echo "LEASE_SUPABASE_SLOT=$k"
+}
+
+slot_project() { echo "${BASE_ID}_lease$1"; }
+
+with_slot_env() { # <slot> cmd... : run cmd with the slot's overrides exported
+  local k=$1; shift
+  local line envs=()
+  while IFS= read -r line; do envs+=("$line"); done < <(slot_env "$k")
+  env "${envs[@]}" "$@"
+}
+
+sb() { # <slot> supabase-args... (in the project root)
+  local k=$1; shift
+  ( cd "$ROOT" && with_slot_env "$k" "$SB" "$@" )
+}
+
+migrations_hash() {
+  local d="$ROOT/supabase/migrations"
+  [ -d "$d" ] || { echo none; return; }
+  ( cd "$d" && find . -type f -name '*.sql' | LC_ALL=C sort | while IFS= read -r f; do
+      printf '== %s\n' "$f"; cat "$f"; done ) | shasum -a 256 | cut -c1-16
+}
+
+# ------------------------------------------------------------------ docker ---
+
+# Running supabase projects, one line each: "<project>\t<workdir>[,<workdir>...]"
+# (containers of one project can carry different workdir labels).
+running_projects() {
+  docker ps --filter label=com.supabase.cli.project \
+    --format '{{.Label "com.supabase.cli.project"}}	{{.Label "com.supabase.cli.workdir"}}' 2>/dev/null |
+    sort -u | awk -F'\t' '$1!=""{ w[$1] = ($1 in w) ? w[$1] "," $2 : $2 } END { for (p in w) print p "\t" w[p] }' | sort
+}
+
+port_users() { # <port>: docker containers publishing it
+  docker ps --filter "publish=$1" --format '{{.Names}} ({{.Label "com.supabase.cli.project"}})' 2>/dev/null
+}
+
+port_listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
+
+ensure_network() {
+  [ -n "$NETWORK" ] || return 0
+  docker network inspect "$NETWORK" >/dev/null 2>&1 && return 0
+  say "creating shared docker network $NETWORK ($SUBNET)"
+  docker network create --subnet "$SUBNET" --label dev.lease.managed=true "$NETWORK" >/dev/null ||
+    die "could not create docker network $NETWORK (set LEASE_SUPABASE_SUBNET or LEASE_SUPABASE_NETWORK=)"
+}
+
+# ------------------------------------------------------------------- lease ---
+
+my_slot() { # prints slot if we hold the lease, else returns 3
+  local out; out=$("$LEASE" token "$RES" 2>/dev/null) || return "$EX_LOST"
+  echo "${out#* }"
+}
+
+slot_meta_get() { "$LEASE" slot-meta "$RES" "$1" 2>/dev/null || echo '{}'; }
+json_get() { sqlite3 :memory: "SELECT json_extract($(sqlq "$1"), '\$.$2');" 2>/dev/null; }
+sqlq() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+
+# ---------------------------------------------------------------- commands ---
+
+usage() {
+  cat <<'EOF'
+lease-supabase — local Supabase stacks in leased slots (one stack per slot)
+
+usage:
+  lease-supabase up [--wait] [--timeout 30m] [--ttl 15m] [--reset | --no-reset]
+                    [-x svc,svc]        acquire a slot, (re)start this worktree's stack in it
+  lease-supabase down [--stop]          release the slot (stack keeps running unless --stop)
+  lease-supabase status                 slots, who holds them, what runs where
+  lease-supabase env [--dotenv|--json]  env for the slot you hold (overrides + URLs/keys)
+  lease-supabase exec -- <cmd...>       run cmd with the slot env (e.g. supabase db reset,
+                                        pnpm test). A bare `supabase` uses the project's CLI.
+  lease-supabase ports [<slot>]         port map of a slot
+
+slot k: project_id <config project_id>_lease<k>, ports = config ports + k*100
+env: LEASE_SUPABASE_RESOURCE (supabase) LEASE_SUPABASE_PORT_STEP (100)
+     LEASE_SUPABASE_SLOT_OFFSET (0) LEASE_SUPABASE_NETWORK (lease-supabase; '' = off)
+     LEASE_SUPABASE_SUBNET LEASE_SUPABASE_BIN LEASE_SUPABASE_OVERRIDE_NAMES
+exit codes: as lease (2 busy, 3 LOST, 4 timeout) + 1 error
+EOF
+}
+
+cmd_up() {
+  local wait=0 timeout=30m ttl='' reset=auto exclude=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wait) wait=1; shift;;
+      --timeout) timeout=${2-}; shift 2;;
+      --ttl) ttl=${2-}; shift 2;;
+      --reset) reset=always; shift;;
+      --no-reset) reset=never; shift;;
+      -x|--exclude) exclude=${2-}; shift 2;;
+      *) die "unknown option $1";;
+    esac
+  done
+  load_project
+  command -v docker >/dev/null || die "docker not found"
+  docker info >/dev/null 2>&1 || die "docker is not running"
+
+  local wt_meta hash
+  hash=$(migrations_hash)
+  wt_meta=$(sqlite3 :memory: "SELECT json_object('repo', $(sqlq "$REPO"), 'worktree', $(sqlq "$ROOT"), 'branch', $(sqlq "$BRANCH"), 'base_project_id', $(sqlq "$BASE_ID"), 'migrations_hash', $(sqlq "$hash"));")
+
+  local acq=(--meta "$wt_meta") out rc
+  [ -n "$ttl" ] && acq+=(--ttl "$ttl")
+  if [ "$wait" = 1 ]; then out=$("$LEASE" wait "$RES" --timeout "$timeout" "${acq[@]}"); rc=$?
+  else out=$("$LEASE" acquire "$RES" "${acq[@]}"); rc=$?; fi
+  [ $rc -eq 0 ] || exit $rc
+  local slot=${out#* } pid
+  pid=$(slot_project "$slot")
+  "$LEASE" meta "$RES" --set "{\"project_id\":\"$pid\",\"slot\":$slot}" >/dev/null
+  say "holding $RES slot $slot → project_id $pid"
+
+  fail() { say "$*"; say "releasing $RES slot $slot"; "$LEASE" release "$RES" >/dev/null 2>&1; exit "$EX_ERR"; }
+
+  # 1. What runs on this slot right now?
+  local proj wd mine_running=0
+  while IFS=$'\t' read -r proj wd; do
+    [ -n "$proj" ] || continue
+    case "$proj" in
+      *_lease"$slot")
+        if [ "$proj" = "$pid" ] && [ "$wd" = "$ROOT" ]; then
+          mine_running=1
+        else
+          say "stopping previous stack of slot $slot: $proj (from ${wd:-?}); volumes are kept"
+          ( cd /tmp && "$SB" stop --project-id "$proj" ) >/dev/null 2>&1 || fail "could not stop $proj"
+        fi;;
+    esac
+  done < <(running_projects)
+
+  # 2. Ports must be free (or ours, if our stack is already up).
+  if [ "$mine_running" = 0 ]; then
+    local line var port busy=''
+    while IFS= read -r line; do
+      var=${line%%=*}; port=${line#*=}
+      case "$var" in *_PORT) ;; *) continue;; esac
+      case "$var" in SUPABASE_INBUCKET_*|SUPABASE_EDGE_RUNTIME_INSPECTOR_PORT) continue;; esac
+      if port_listening "$port"; then busy="$busy\n  $port ($var): $(port_users "$port" | paste -sd, - | sed 's/^$/non-docker process/')"; fi
+    done < <(slot_env "$slot")
+    [ -z "$busy" ] || fail "ports of slot $slot are in use by something that is not this slot's stack — not touching it:$(printf "$busy")
+hint: stop it yourself if it is yours, or shift slots with LEASE_SUPABASE_SLOT_OFFSET=1"
+  fi
+
+  # 3. Start (or reuse) our stack.
+  local fresh=0
+  docker volume inspect "supabase_db_$pid" >/dev/null 2>&1 || fresh=1
+  if [ "$mine_running" = 1 ]; then
+    say "stack $pid already running from this worktree — reusing it"
+  else
+    ensure_network
+    local sargs=(start)
+    [ -n "$exclude" ] && sargs+=(-x "$exclude")
+    say "starting $pid (slot $slot)$( [ $fresh = 1 ] && echo ', fresh volumes') …"
+    sb "$slot" "${sargs[@]}" >&2 || fail "supabase start failed"
+  fi
+
+  # 4. Migrations drift. Volumes belong to <project>_lease<k>, so the DB in
+  #    them may have been migrated by another worktree/branch of this repo.
+  #    Slot meta remembers, per project id, which hash/worktree set it up.
+  local smeta prev_hash prev_wt db_hash db_wt do_reset=0
+  smeta=$(slot_meta_get "$slot")
+  prev_hash=$(json_get "$smeta" "db.\"$pid\".migrations_hash")
+  prev_wt=$(json_get "$smeta" "db.\"$pid\".worktree")
+  db_hash=$hash; db_wt=$ROOT   # what the DB will reflect, and who migrated it
+  if [ "$fresh" = 1 ]; then
+    : # supabase start just applied every migration
+  elif [ "$reset" = always ]; then
+    do_reset=1
+  elif [ "$prev_hash" = "$hash" ]; then
+    :
+  elif [ -n "$prev_hash" ] && [ "$prev_wt" = "$ROOT" ]; then
+    say "migrations changed in this worktree since its last up ($prev_hash → $hash);"
+    say "  apply them: lease-supabase exec -- supabase migration up   (or: lease-supabase up --reset)"
+    db_hash=$prev_hash; db_wt=$prev_wt
+  elif [ "$reset" = never ]; then
+    say "WARNING: DB of $pid was last migrated by ${prev_wt:-an unknown worktree} (${prev_hash:-unknown}); this worktree has $hash."
+    say "  reset it: lease-supabase exec -- supabase db reset"
+    db_hash=${prev_hash:-unknown}; db_wt=${prev_wt:-unknown}
+  else
+    say "DB of $pid was last migrated by ${prev_wt:-an unknown worktree} (${prev_hash:-unknown} ≠ $hash) → supabase db reset"
+    do_reset=1
+  fi
+  if [ "$do_reset" = 1 ]; then
+    sb "$slot" db reset >&2 || fail "supabase db reset failed"
+  fi
+
+  # 5. Record what now lives in the slot.
+  local smeta_new
+  smeta_new=$(sqlite3 :memory: "SELECT json_patch($(sqlq "$wt_meta"), json_object(
+      'project_id', $(sqlq "$pid"), 'slot', $slot,
+      'started_at', strftime('%Y-%m-%dT%H:%M:%S','now','localtime'),
+      'db', json_object($(sqlq "$pid"), json_object('migrations_hash', $(sqlq "$db_hash"),
+                                                  'worktree', $(sqlq "$db_wt")))));")
+  "$LEASE" slot-meta "$RES" "$slot" --set "$smeta_new" >/dev/null || say "warning: could not record slot meta (lease LOST?)"
+
+  echo "slot=$slot project_id=$pid"
+  slot_env "$slot" | grep -E '^SUPABASE_(API|DB|STUDIO)_PORT=' | tr '\n' ' '; echo
+  say "next: lease-supabase exec -- <cmd>   |   eval \"\$(lease-supabase env)\"   |   lease-supabase down"
+}
+
+cmd_down() {
+  local stop=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stop) stop=1; shift;;
+      --keep-running) stop=0; shift;;
+      *) die "unknown option $1";;
+    esac
+  done
+  load_project
+  local slot; slot=$(my_slot) || die "you hold no $RES lease" "$EX_LOST"
+  if [ "$stop" = 1 ]; then
+    local pid; pid=$(slot_project "$slot")
+    say "stopping $pid (volumes kept)"
+    ( cd /tmp && "$SB" stop --project-id "$pid" ) >/dev/null 2>&1 || say "warning: stop failed"
+  fi
+  "$LEASE" release "$RES"
+}
+
+# env vars: overrides + `supabase status -o env` (URLs, keys) for the held slot
+collect_env() {
+  load_project
+  local slot; slot=$(my_slot) || die "you hold no $RES lease — run: lease-supabase up" "$EX_LOST"
+  ENV_SLOT=$slot
+  slot_env "$slot"
+  local args=(status -o env) n
+  if [ -n "${LEASE_SUPABASE_OVERRIDE_NAMES-}" ]; then
+    for n in $(echo "$LEASE_SUPABASE_OVERRIDE_NAMES" | tr ',' ' '); do args+=(--override-name "$n"); done
+  fi
+  sb "$slot" "${args[@]}" 2>/dev/null | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/^\([^=]*\)="\(.*\)"$/\1=\2/'
+}
+
+cmd_env() {
+  local fmt=sh
+  case "${1-}" in --dotenv) fmt=dotenv;; --json) fmt=json;; '') ;; *) die "unknown option $1";; esac
+  local lines; lines=$(collect_env) || exit $?
+  case "$fmt" in
+    sh) printf '%s\n' "$lines" | while IFS= read -r l; do
+          printf 'export %s=%s\n' "${l%%=*}" "$(printf '%q' "${l#*=}")"; done;;
+    dotenv) printf '%s\n' "$lines" | while IFS= read -r l; do printf '%s="%s"\n' "${l%%=*}" "${l#*=}"; done;;
+    json) printf '%s\n' "$lines" | awk -F= '{k=$1; v=substr($0, length(k)+2); gsub(/\\/,"\\\\",v); gsub(/"/,"\\\"",v); printf "%s\"%s\":\"%s\"", (NR>1?",":"{"), k, v} END{print "}"}';;
+  esac
+}
+
+cmd_exec() {
+  [ "${1-}" = -- ] && shift
+  [ $# -gt 0 ] || die "usage: lease-supabase exec -- <cmd...>"
+  local lines; lines=$(collect_env) || exit $?
+  load_project
+  local envs=() l
+  while IFS= read -r l; do [ -n "$l" ] && envs+=("$l"); done <<<"$lines"
+  if [ "$1" = supabase ]; then shift; set -- "$SB" "$@"; fi
+  exec env "${envs[@]}" "$@"
+}
+
+cmd_ports() {
+  load_project
+  local slot=${1-}
+  [ -n "$slot" ] || slot=$(my_slot) || die "give a slot number or hold a lease"
+  slot_env "$slot"
+}
+
+cmd_status() {
+  if find_root >/dev/null; then load_project; else ROOT=''; BASE_ID='?'; fi
+  "$LEASE" ls "$RES"
+  echo
+  echo "running supabase stacks:"
+  local proj wd tag
+  while IFS=$'\t' read -r proj wd; do
+    [ -n "$proj" ] || continue
+    case "$proj" in *_lease[0-9]*) tag="slot ${proj##*_lease}";; *) tag="unmanaged";; esac
+    [ "$wd" = "${ROOT:-//}" ] && tag="$tag, this worktree"
+    printf '  %-32s %-24s %s\n' "$proj" "[$tag]" "$wd"
+  done < <(running_projects)
+  local s; s=$(my_slot) && echo && echo "you hold slot $s → $(slot_project "$s")"
+  return 0
+}
+
+[ $# -gt 0 ] || { usage; exit "$EX_ERR"; }
+sub=$1; shift
+case "$sub" in
+  up) cmd_up "$@";;
+  down) cmd_down "$@";;
+  status|ls) cmd_status "$@";;
+  env) cmd_env "$@";;
+  exec|run) cmd_exec "$@";;
+  ports) cmd_ports "$@";;
+  -h|--help|help) usage;;
+  *) usage >&2; exit "$EX_ERR";;
+esac
