@@ -98,7 +98,7 @@ servidor, sin dependencias (bash 3.2 + `sqlite3` + `ps`, todo de serie en macOS)
 ```
 $ lease ls
 RESOURCE       SLOT STATE    HOLDER                           PID SINCE     LEFT      META
-supabase          0 held     myapp@feature-x        38187 10:32:59  14m12s    {"project_id":"myapp_lease0",…
+supabase          0 held     myapp@feature-x                  38187 10:32:59  14m12s    {"project_id":"myapp_lease0",…
 supabase          1 free     -                                  - -         -         (last: {"project_id":"myapp_lease1",…
 ```
 
@@ -322,7 +322,7 @@ chocan. `LEASE_SUPABASE_NETWORK=` vuelve al comportamiento normal.
 
 1. `lease acquire supabase` (o `wait`), con meta `{repo, worktree, branch, project_id, migrations_hash, slot}`.
 2. Busca stacks corriendo con project_id `*_lease<k>`, que son los del slot `k`, de cualquier repo. Si es el suyo y lo arrancó este worktree, lo **reutiliza**. Si no, hace `supabase stop --project-id <ese>`, que **conserva volúmenes**. Solo para stacks de *su* slot: lo comprueba por el sufijo `_lease<k>`.
-3. Si algún puerto del slot sigue ocupado (p. ej. un stack sin gestionar en los puertos por defecto, como hoy `myapp` en 5432x), **no lo toca**: libera el lease y falla diciendo qué contenedor es.
+3. Si algún puerto del slot sigue ocupado (p. ej. un stack sin gestionar en los puertos por defecto, como `myapp` en 5432x), **no lo toca**: libera el lease y falla diciendo qué contenedor es.
 4. `supabase start` con el entorno del slot (`-x` para excluir servicios).
 5. **Deriva de migraciones**: el meta del slot guarda, por project_id, el hash de `supabase/migrations/` y qué worktree migró esa BD.
    - volúmenes recién creados → nada que hacer (`start` aplica todo);
