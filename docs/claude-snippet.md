@@ -28,7 +28,8 @@ SQLite at ~/.local/state/lease). Rules:
 - Acquire leases on demand, only when you actually need the resource (at any point in
   the session), and release them when done. Your leases are renewed automatically by a
   hook on every tool call. If you go
-  idle >15 min they expire and someone else can take the slot.
+  idle >15 min they expire, but are only taken if someone else needs
+  the slot (no free slot left).
 - If you see **"lease: you LOST …"** (hook message) or any `lease` command exits **3**:
   stop using that resource immediately (its stack may now be someone else's) and
   run `lease-supabase up` again before touching Supabase.

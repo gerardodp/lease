@@ -14,9 +14,10 @@ bash y `ps`.
 - **Acquire / release.** `lease acquire supabase` da el recurso si está libre;
   si no, sale con código 2 e indica quién lo tiene (`lease wait` encola).
   `lease release supabase` lo devuelve.
-- **Caducidad.** Un lease no renovado caduca al acabar su TTL, y también en
-  cuanto muere la sesión de Claude que lo tenía. Nadie queda bloqueado por un
-  agente colgado.
+- **Caducidad.** Si muere la sesión de Claude que lo tenía, el lease queda libre
+  al instante. Si la sesión sigue viva pero no renueva, el lease caduca al acabar
+  su TTL, pero solo se lo quitan si otro lo necesita (no queda ningún slot
+  libre). Sin nadie esperando, caducar no cuesta nada: ni prisa ni `hold`.
 - **Fencing.** Cada acquire genera un token nuevo. Si tu lease caducó y otro se
   lo quedó, tus `renew`/`release` devuelven LOST (código 3): ya no es tuyo.
 - **Heartbeat.** Un hook de Claude Code (`PreToolUse`/`PostToolUse`) renueva en
@@ -102,7 +103,7 @@ supabase          0 held     myapp@feature-x                  38187 10:32:59  14
 supabase          1 free     -                                  - -         -         (last: {"project_id":"myapp_lease1",…
 ```
 
-- **Lease, no lock**: "es mío hasta las 10:42". Si no se renueva antes, cualquiera puede quedárselo.
+- **Lease, no lock**: "es mío hasta las 10:42". Si no se renueva antes, otro puede quedárselo, pero solo si necesita el slot.
 - **Fencing token**: cada acquire nuevo genera uno. Si te dan por muerto y otro se lo queda, tu `renew`/`release` devuelve **LOST** (exit 3).
 - **Capacidad N** (v2): un recurso tiene N slots; acquire da el slot libre más bajo.
 - **Heartbeat sin depender del modelo**: un hook de Claude Code renueva los leases del agente en cada tool call.
@@ -252,8 +253,11 @@ de un lease se decide así:
 Junto al PID se guarda su hora de arranque (`ps -o lstart`): si el PID se reutiliza
 con otro proceso, el lease cuenta como muerto.
 
-Un lease está **muerto** si `expires_at <= now` o si su PID ya no existe. Un
-acquire sobre un lease muerto es un **steal**: el log registra `expire` (holder
+Un lease está **muerto** si su PID ya no existe, y **caducado** si
+`expires_at <= now`. Un acquire recoge siempre los muertos; los caducados solo
+bajo contención: si quien adquiere no tiene ya un lease y no queda ningún slot
+libre, recoge **uno**, el renovado hace más tiempo. Con un slot libre no se
+toca a nadie. Recoger un lease es un **steal**: el log registra `expire` (holder
 anterior, motivo `ttl|pid`) y `steal` (nuevo holder, "from <anterior>"), y se
 encola un aviso `lost` para el holder anterior.
 
@@ -357,7 +361,8 @@ los volúmenes.
 - Una sola máquina: los PIDs y el reloj son locales. No uses la DB en un FS de red.
 - `wait` es polling con jitter, no una cola FIFO: no hay garantía de orden.
 - Un lease caducado pero no reclamado por nadie se **revive** en el siguiente renew de su dueño. Es a propósito: nadie lo tenía.
-- El hook solo renueva por actividad del agente. Un agente pensando más de 15 min sin tool calls pierde el lease.
+- El hook solo renueva por actividad del agente. Un agente más de 15 min sin tool calls puede perder el lease, pero solo si en ese rato otro necesita el slot.
+- Un agente colgado pero vivo retiene su slot hasta que alguien lo necesite.
 - `capacity` menor que los slots ocupados no expulsa a nadie: esos slots se marcan `held*` hasta que se liberen.
 - El holder fallback (`pid:host:pid:cwd`) cambia con cada shell. Fuera de Claude/Orca, fija `LEASE_HOLDER`.
 

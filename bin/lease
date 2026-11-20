@@ -285,12 +285,30 @@ BEGIN IMMEDIATE;
 INSERT OR IGNORE INTO resources(name, capacity) VALUES ($(sq "$res"), 1);
 INSERT INTO holders(holder, label, seen_at) VALUES ($(sq "$HOLDER"), $(sq "$LABEL"), $t)
   ON CONFLICT(holder) DO UPDATE SET label = excluded.label, seen_at = excluded.seen_at;
+-- Leases whose owner process is gone are always reaped.
 CREATE TEMP TABLE reaped AS
   SELECT resource, slot, holder, label, pid, token,
          CASE WHEN expires_at < $t THEN 'ttl' ELSE 'pid' END AS why
   FROM leases
   WHERE resource = $(sq "$res") AND holder <> $(sq "$HOLDER")
-    AND (expires_at < $t OR token IN $dead);
+    AND token IN $dead;
+-- An expired lease (owner alive, just quiet) is reaped only on contention:
+-- when the caller has no lease and there is no free slot. Then only one,
+-- the least recently renewed. With nobody waiting, expiry costs nothing.
+INSERT INTO reaped
+  SELECT resource, slot, holder, label, pid, token, 'ttl'
+  FROM leases
+  WHERE resource = $(sq "$res") AND holder <> $(sq "$HOLDER")
+    AND expires_at < $t
+    AND token NOT IN (SELECT token FROM reaped)
+    AND slot < (SELECT capacity FROM resources WHERE name = $(sq "$res"))
+    AND NOT EXISTS (SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER"))
+    AND (SELECT COUNT(*) FROM leases
+         WHERE resource = $(sq "$res")
+           AND slot < (SELECT capacity FROM resources WHERE name = $(sq "$res"))
+           AND token NOT IN (SELECT token FROM reaped))
+        >= (SELECT capacity FROM resources WHERE name = $(sq "$res"))
+  ORDER BY renewed_at LIMIT 1;
 DELETE FROM leases WHERE token IN (SELECT token FROM reaped);
 CREATE TEMP TABLE st AS SELECT EXISTS(
   SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER")) AS mine;
@@ -840,7 +858,7 @@ top_frame() { # <log lines> <width>: prints one frame
         case "$state" in
           free)    col=$D; [ -n "$smeta" ] && note='(warm: last use kept)';;
           held)    col=$G;;
-          expired) col=$RED; note='expired: anyone can take it';;
+          expired) col=$RED; note='expired: taken only if someone needs the slot';;
           dead)    col=$RED; note='owner process gone: anyone can take it';;
         esac
         if [ "$state" != free ]; then

@@ -94,6 +94,28 @@ test_ttl_expiry_and_steal() {
   eq "$(q "SELECT holder FROM leases")" B "B still holds it"
 }
 
+test_expired_kept_without_contention() {
+  local ta tb
+  as X capacity db 2 >/dev/null
+  ta=$(as A acquire db --ttl 1s | cut -d' ' -f1)
+  sleep 3
+  # a free slot exists: B takes it and A's expired lease is left alone
+  eq "$(as B acquire db --ttl 1s | cut -d' ' -f2)" 1 "B gets the free slot"
+  eq "$(q "SELECT holder FROM leases WHERE slot=0")" A "A keeps slot 0"
+  eq "$(rc as A renew db "$ta")" 0 "A renews its expired lease fine"
+  # no free slot, both expired: C reaps only one, the least recently renewed (B)
+  sleep 3
+  as A renew db "$ta" --ttl 1s >/dev/null; sleep 2
+  eq "$(as C acquire db | cut -d' ' -f2)" 1 "C takes B's slot"
+  eq "$(q "SELECT holder FROM leases WHERE slot=0")" A "A untouched"
+  eq "$(q "SELECT count(*) FROM leases")" 2 "only one reaped"
+  has "$(as C log db)" "from B (ttl)"
+  # re-acquire by an existing holder never reaps anyone
+  sleep 2
+  as C acquire db >/dev/null
+  eq "$(q "SELECT holder FROM leases WHERE slot=0")" A "idempotent re-acquire reaps nobody"
+}
+
 test_dead_pid() {
   sleep 300 & local p=$!
   LEASE_PID=$p as A acquire db --ttl 1h >/dev/null
@@ -346,7 +368,7 @@ test_top() {
   has "$o" "RESOURCE"; has "$o" "Repo@feature-x"
   has "$o" "|____\\___\\__,_/__/\\___|" "banner"
   case "$(LEASE_TOP_PANELS= "$LEASE" top --once --no-banner)" in *"|____"*) bad "--no-banner";; esac
-  has "$o" "expired: anyone can take it"
+  has "$o" "expired: taken only if someone needs the slot"
   has "$o" "RECENT ACTIVITY"; has "$o" "acquire  db#0"
   case "$o" in *orca:pane-1*) bad "log must show the label, not the holder id";; esac
   case "$o" in *$'\033'*) bad "no colours when not a tty";; esac
