@@ -9,7 +9,7 @@
 #   4 timeout (wait) · 5 not found
 set -u
 
-LEASE_VERSION=1
+LEASE_VERSION=2
 EX_OK=0 EX_ERR=1 EX_BUSY=2 EX_LOST=3 EX_TIMEOUT=4 EX_NOTFOUND=5
 
 DB="${LEASE_DB:-${XDG_STATE_HOME:-$HOME/.local/state}/lease/lease.db}"
@@ -179,7 +179,13 @@ CREATE TABLE IF NOT EXISTS lost(
   ts       INTEGER NOT NULL,
   detail   TEXT
 );
-PRAGMA user_version=1;
+-- Last known human label of each holder (for log views).
+CREATE TABLE IF NOT EXISTS holders(
+  holder  TEXT PRIMARY KEY,
+  label   TEXT,
+  seen_at INTEGER
+);
+PRAGMA user_version=2;
 COMMIT;
 SQL
 }
@@ -251,6 +257,9 @@ usage:
   lease resource-meta <res> [--set JSON]  shared config of a resource (merged)
   lease log [<res>] [-n 50]              history
   lease whoami                           holder id + owner pid and how they were found
+  lease top [--interval 2s] [--once] [-n N]
+                                         live read-only view: slots, panels
+                                         (lease-* panel), recent activity
 
 exit codes: 0 ok · 1 error · 2 busy · 3 LOST · 4 timeout · 5 not found
 env: LEASE_DB LEASE_HOLDER LEASE_PID LEASE_LABEL LEASE_TTL LEASE_AGENT_PROCS
@@ -274,8 +283,10 @@ do_acquire() {
   out=$(sql <<SQL
 BEGIN IMMEDIATE;
 INSERT OR IGNORE INTO resources(name, capacity) VALUES ($(sq "$res"), 1);
+INSERT INTO holders(holder, label, seen_at) VALUES ($(sq "$HOLDER"), $(sq "$LABEL"), $t)
+  ON CONFLICT(holder) DO UPDATE SET label = excluded.label, seen_at = excluded.seen_at;
 CREATE TEMP TABLE reaped AS
-  SELECT resource, slot, holder, pid, token,
+  SELECT resource, slot, holder, label, pid, token,
          CASE WHEN expires_at < $t THEN 'ttl' ELSE 'pid' END AS why
   FROM leases
   WHERE resource = $(sq "$res") AND holder <> $(sq "$HOLDER")
@@ -313,7 +324,7 @@ INSERT INTO log(ts, resource, slot, holder, action, detail)
               WHEN r.holder IS NOT NULL THEN 'steal'
               ELSE 'acquire' END,
          CASE WHEN st.mine THEN 're-acquire (idempotent)'
-              WHEN r.holder IS NOT NULL THEN 'from ' || r.holder || ' (' || r.why || ')'
+              WHEN r.holder IS NOT NULL THEN 'from ' || IFNULL(r.label, r.holder) || ' (' || r.why || ')'
               ELSE 'ttl=' || l.ttl END
   FROM leases l CROSS JOIN st LEFT JOIN reaped r ON r.slot = l.slot
   WHERE l.resource = $(sq "$res") AND l.holder = $(sq "$HOLDER");
@@ -673,6 +684,31 @@ SQL
   if [ -n "$out" ]; then echo "$out"; else echo "{}"; fi
 }
 
+ls_sql() { # <filter> <now> <dead-list>: one row per resource slot
+  local filter=$1 t=$2 dead=$3
+  cat <<SQL
+WITH RECURSIVE
+  allres AS (SELECT name, capacity FROM resources
+             UNION SELECT DISTINCT resource, 1 FROM leases WHERE resource NOT IN (SELECT name FROM resources)),
+  maxslot AS (SELECT a.name, MAX(a.capacity - 1, IFNULL((SELECT MAX(slot) FROM leases WHERE resource = a.name), 0)) AS m FROM allres a),
+  s(name, k) AS (SELECT name, 0 FROM maxslot UNION ALL SELECT s.name, k + 1 FROM s JOIN maxslot USING (name) WHERE k < m)
+SELECT r.name AS resource, s.k AS slot, r.capacity AS capacity,
+       CASE WHEN l.token IS NULL THEN 'free'
+            WHEN l.token IN $dead THEN 'dead'
+            WHEN l.expires_at < $t THEN 'expired'
+            ELSE 'held' END AS state,
+       l.holder AS holder, l.label AS label, l.pid AS pid,
+       l.acquired_at AS acquired_at, l.expires_at AS expires_at,
+       CASE WHEN l.token IS NULL THEN NULL ELSE l.expires_at - $t END AS left_s,
+       l.meta AS meta, sl.meta AS slot_meta, l.renewed_at AS renewed_at
+FROM s JOIN allres r ON r.name = s.name
+  LEFT JOIN leases l ON l.resource = s.name AND l.slot = s.k
+  LEFT JOIN slots sl ON sl.resource = s.name AND sl.slot = s.k
+WHERE $filter
+ORDER BY r.name, s.k
+SQL
+}
+
 cmd_ls() {
   local json=0 res='' mine=0
   while [ $# -gt 0 ]; do
@@ -690,29 +726,7 @@ cmd_ls() {
   dead=$(dead_tokens) || die "database error"
   [ -n "$res" ] && filter="r.name = $(sq "$res")"
   if [ "$mine" = 1 ]; then init_ctx; filter="$filter AND l.holder = $(sq "$HOLDER")"; fi
-  local q
-  q=$(cat <<SQL
-WITH RECURSIVE
-  allres AS (SELECT name, capacity FROM resources
-             UNION SELECT DISTINCT resource, 1 FROM leases WHERE resource NOT IN (SELECT name FROM resources)),
-  maxslot AS (SELECT a.name, MAX(a.capacity - 1, IFNULL((SELECT MAX(slot) FROM leases WHERE resource = a.name), 0)) AS m FROM allres a),
-  s(name, k) AS (SELECT name, 0 FROM maxslot UNION ALL SELECT s.name, k + 1 FROM s JOIN maxslot USING (name) WHERE k < m)
-SELECT r.name AS resource, s.k AS slot, r.capacity AS capacity,
-       CASE WHEN l.token IS NULL THEN 'free'
-            WHEN l.token IN $dead THEN 'dead'
-            WHEN l.expires_at < $t THEN 'expired'
-            ELSE 'held' END AS state,
-       l.holder AS holder, l.label AS label, l.pid AS pid,
-       l.acquired_at AS acquired_at, l.expires_at AS expires_at,
-       CASE WHEN l.token IS NULL THEN NULL ELSE l.expires_at - $t END AS left_s,
-       l.meta AS meta, sl.meta AS slot_meta
-FROM s JOIN allres r ON r.name = s.name
-  LEFT JOIN leases l ON l.resource = s.name AND l.slot = s.k
-  LEFT JOIN slots sl ON sl.resource = s.name AND sl.slot = s.k
-WHERE $filter
-ORDER BY r.name, s.k
-SQL
-)
+  local q; q=$(ls_sql "$filter" "$t" "$dead")
   if [ "$json" = 1 ]; then
     local o; o=$(sqlite3 -json -cmd ".timeout $BUSY_TIMEOUT_MS" "$DB" "$q;") || die "database error"
     echo "${o:-[]}"; return
@@ -721,8 +735,8 @@ SQL
   local rows; rows=$(sql -separator "$US" <<<"$q;") || die "database error"
   [ -z "$rows" ] && { echo "(nothing)"; return; }
   printf '%-14s %4s %-8s %-28s %7s %-9s %-9s %s\n' RESOURCE SLOT STATE HOLDER PID SINCE LEFT META
-  local name slot cap state holder label pid acq exp left meta smeta
-  while IFS="$US" read -r name slot cap state holder label pid acq exp left meta smeta; do
+  local name slot cap state holder label pid acq exp left meta smeta ren
+  while IFS="$US" read -r name slot cap state holder label pid acq exp left meta smeta ren; do
     local who='-' since='-' l='-' m=''
     if [ "$state" != free ]; then
       who=${label:-$holder}
@@ -764,6 +778,150 @@ SELECT * FROM (
 SQL
 }
 
+# ------------------------------------------------------------------- top ---
+# Live, read-only dashboard: slots, extra panels, recent log.
+# Panels: every executable `lease-*` next to this script (or the list in
+# LEASE_TOP_PANELS, ':'-separated; '' = none) is run as `<exe> panel`; whatever
+# it prints (exit 0) is shown. Keeps `lease` itself resource-agnostic.
+
+self_dir() {
+  local self=$0 l
+  while [ -L "$self" ]; do
+    l=$(readlink "$self"); case "$l" in /*) self=$l;; *) self=$(dirname "$self")/$l;; esac
+  done
+  (cd "$(dirname "$self")" && pwd)
+}
+
+# run with a time limit (macOS has no `timeout`)
+with_timeout() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"; }
+
+top_panels() {
+  local list p
+  if [ "${LEASE_TOP_PANELS+set}" = set ]; then
+    list=$LEASE_TOP_PANELS
+  else
+    list=''
+    for p in "$(self_dir)"/lease-*; do [ -x "$p" ] && list="$list:$p"; done
+    list=${list#:}
+  fi
+  local IFS=:
+  for p in $list; do echo "$p"; done
+}
+
+top_frame() { # <log lines> <width>: prints one frame
+  local nlog=$1 width=$2 t dead
+  local B='' D='' R='' G='' Y='' RED='' C=''
+  if [ "$TOP_COLOR" = 1 ]; then
+    B=$'\033[1m' D=$'\033[2m' R=$'\033[0m' G=$'\033[32m' Y=$'\033[33m' RED=$'\033[31m' C=$'\033[36m'
+  fi
+  local rule; rule=$(printf '%*s' "$width" '' | tr ' ' '-')
+  printf '%slease top%s · %s · db %s\n' "$B" "$R" "$(date '+%H:%M:%S')" "$DB"
+  echo "$D$rule$R"
+  if [ ! -s "$DB" ]; then
+    echo "(no leases yet)"
+  else
+    t=$(now); dead=$(dead_tokens) || { echo "database error"; return; }
+    local US; US=$(printf '\037')
+    local rows; rows=$(sql -separator "$US" <<<"$(ls_sql 1 "$t" "$dead");")
+    if [ -z "$rows" ]; then
+      echo "(no resources)"
+    else
+      printf '%s%-14s %4s  %-8s %-30s %-8s %-8s %s%s\n' "$B" RESOURCE SLOT STATE HOLDER SINCE LEFT NOTE "$R"
+      local name slot cap state holder label pid acq exp left meta smeta ren col note who since l idle
+      while IFS="$US" read -r name slot cap state holder label pid acq exp left meta smeta ren; do
+        note='' who='-' since='-' l='-'
+        case "$state" in
+          free)    col=$D; [ -n "$smeta" ] && note='(warm: last use kept)';;
+          held)    col=$G;;
+          expired) col=$RED; note='expired: anyone can take it';;
+          dead)    col=$RED; note='owner process gone: anyone can take it';;
+        esac
+        if [ "$state" != free ]; then
+          who=${label:-$holder}
+          since=$(date -r "$acq" '+%H:%M')
+          if [ "$left" -gt 0 ]; then l=$(fmt_dur "$left"); else l="-$(fmt_dur $((-left)))"; fi
+          idle=$(( t - ${ren:-$t} ))
+          if [ "$state" = held ] && [ "$idle" -ge 120 ]; then
+            col=$Y; note="last renewed $(fmt_dur "$idle") ago"
+          fi
+        fi
+        [ "$slot" -ge "$cap" ] && note="over capacity${note:+; $note}"
+        printf '%s%-14s %4s  %-8s %-30s %-8s %-8s %s%s\n' "$col" "${name:0:14}" "$slot" "$state" "${who:0:30}" "$since" "$l" "$note" "$R"
+      done <<EOF
+$rows
+EOF
+    fi
+  fi
+  local p out
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    out=$(with_timeout 8 "$p" panel 2>/dev/null) || continue
+    [ -n "$out" ] || continue
+    echo "$D$rule$R"
+    printf '%s\n' "$out" | awk -v b="$B" -v r="$R" 'NR==1{print b $0 r; next} {print}'
+  done <<EOF
+$(top_panels)
+EOF
+  [ "$nlog" -gt 0 ] || return 0
+  echo "$D$rule$R"
+  echo "${B}RECENT ACTIVITY$R"
+  [ -s "$DB" ] || { echo "(none)"; return 0; }
+  local ts res sl act h det c US; US=$(printf '\037')
+  while IFS="$US" read -r ts res sl act h det; do
+    case "$act" in
+      steal|expire|lost) c=$RED;;
+      acquire) c=$G;;
+      release) c=$D;;
+      capacity|meta|resource-meta) c=$C;;
+      *) c='';;
+    esac
+    local line; line=$(printf '%s  %-8s %-14s %s' "$ts" "$act" "$res${sl:+#$sl}" "$h${det:+  ($det)}")
+    printf '%s%s%s\n' "$c" "${line:0:$width}" "$R"
+  done < <(sql -separator "$US" <<SQL
+SELECT t, r, s, a, h, d FROM (
+  SELECT g.id, strftime('%H:%M:%S', g.ts, 'unixepoch', 'localtime') AS t, IFNULL(g.resource,'-') AS r,
+         IFNULL(g.slot,'') AS s, g.action AS a, IFNULL(hl.label, IFNULL(g.holder,'-')) AS h,
+         replace(IFNULL(g.detail,''), char(9), ' ') AS d
+  FROM log g LEFT JOIN holders hl ON hl.holder = g.holder
+  WHERE g.action <> 'renew' ORDER BY g.id DESC LIMIT $nlog) ORDER BY id;
+SQL
+  ) 2> /dev/null
+}
+
+cmd_top() {
+  local interval=2 once=0 nlog=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval|-i) interval=$(parse_dur "${2-}") || die "bad --interval"; shift 2;;
+      --once|-1) once=1; shift;;
+      -n) nlog=${2-}; shift 2;;
+      *) die "usage: lease top [--interval 2s] [--once] [-n LOG_LINES]";;
+    esac
+  done
+  [ "$interval" -ge 1 ] 2>/dev/null || interval=1
+  [ -z "$nlog" ] || is_uint "$nlog" || die "-n must be a number"
+  TOP_COLOR=0
+  [ -t 1 ] && [ -z "${NO_COLOR-}" ] && TOP_COLOR=1
+  if [ "$once" = 1 ] || [ ! -t 1 ]; then
+    top_frame "${nlog:-10}" "${COLUMNS:-100}"
+    return 0
+  fi
+  # the log table hides `renew` (it would drown everything else)
+  tput civis 2>/dev/null
+  trap 'tput cnorm 2>/dev/null; printf "\n"; exit 0' INT TERM
+  local frame key rows cols n
+  while :; do
+    rows=$(tput lines 2>/dev/null || echo 40); cols=$(tput cols 2>/dev/null || echo 100)
+    n=${nlog:-$(( rows / 3 ))}
+    frame=$(top_frame "$n" "$cols")
+    printf '\033[H\033[2J%s\n%s' "$frame" "$(printf '\033[2mrefresh %ss · q to quit\033[0m' "$interval")"
+    key=''
+    read -rs -n1 -t "$interval" key 2>/dev/null </dev/tty || :
+    case "$key" in q|Q) break;; esac
+  done
+  tput cnorm 2>/dev/null; printf '\n'
+}
+
 # ------------------------------------------------------------------ main ---
 
 command -v sqlite3 >/dev/null || die "sqlite3 not found"
@@ -784,6 +942,7 @@ case "$sub" in
   resource-meta)  cmd_resource_meta "$@";;
   log)            cmd_log "$@";;
   whoami)         cmd_whoami "$@";;
+  top|watch)      cmd_top "$@";;
   -h|--help|help) usage;;
   *) usage >&2; exit "$EX_ERR";;
 esac

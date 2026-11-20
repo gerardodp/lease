@@ -71,6 +71,31 @@ lease ls                                     # ¿quién tiene qué?
 `exec` es importante: un `supabase …` a secas apunta al stack por defecto, que
 no es el tuyo. `exec` le pasa los puertos y el nombre de tu plaza.
 
+### Ver cómo va todo: `lease top`
+
+Abre una pestaña y deja corriendo:
+
+```sh
+lease top              # se refresca cada 2 s; q para salir
+lease top --once       # una sola foto (para pegarla en un chat)
+```
+
+Verás tres bloques:
+
+1. **Quién tiene qué**: cada recurso y plaza, quién la tiene (`worktree@rama`),
+   desde cuándo y cuánto le queda. Verde = ocupada y renovándose; amarillo =
+   lleva más de 2 min sin renovar (agente parado o comando largo); rojo =
+   caducada o con la sesión muerta (cualquiera puede quedársela); gris = libre.
+2. **Stacks de Supabase**: lo que corre de verdad en docker, cruzado con las
+   plazas: stack con dueño, plaza libre con su stack aún encendido ("warm"),
+   stacks que no gestiona `lease` (p. ej. el de `myapp`), o plaza
+   ocupada sin stack.
+3. **Últimos movimientos**: préstamos, devoluciones, caducidades y "robos"
+   (en rojo). Las renovaciones del hook no salen, serían ruido.
+
+Solo mira: no libera ni para nada. Sin colores fuera de una terminal o con
+`NO_COLOR=1`.
+
 ### Puesta en marcha (una vez)
 
 ```sh
@@ -167,12 +192,26 @@ lease capacity <res> [<N>]
 lease resource-meta <res> [--set JSON]   (config compartida del recurso, p. ej. puertos de lease-supabase)
 lease log [<res>] [-n 50]
 lease whoami
+lease top [--interval 2s] [--once] [-n N]
 ```
 
 - `token` es opcional en `renew`/`release`/`hold`/`meta`: si no lo pasas se usa el lease del holder actual. Cada Bash tool call es un shell nuevo, así que los agentes no tienen que guardarlo. Si lo pasas, se valida (fencing).
 - Re-adquirir siendo el mismo holder es idempotente: devuelve el mismo token y slot y renueva.
 - Duraciones: `90s`, `15m`, `2h`, `1d` o segundos a secas.
 - `hold … -- cmd` renueva mientras corre `cmd`, devuelve su exit code y, si el lease se pierde, mata `cmd` y sale con 3. Sin `-- cmd`, renueva mientras viva `--pid` (por defecto el proceso que lo llama). No libera el lease al terminar.
+
+### `lease top`
+
+`lease top [--interval 2s] [--once] [-n LINEAS_LOG]`: vista en vivo de solo
+lectura (tabla de slots + paneles + log sin `renew`). Los **paneles** son
+cualquier ejecutable `lease-*` junto a `bin/lease` que responda a `panel`
+(hoy `lease-supabase panel`); la primera línea es el título. `LEASE_TOP_PANELS`
+(lista separada por `:`) los fija a mano; vacío = ninguno. Así `lease` sigue
+sin saber nada de Supabase. Cada panel tiene 8 s de límite.
+
+El log guarda el id del holder (`orca:<pane>`); la tabla `holders` (schema v2,
+se migra sola desde v1) recuerda su última etiqueta `worktree@rama` para
+mostrarla.
 
 ### Exit codes (estables)
 

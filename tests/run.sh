@@ -337,6 +337,42 @@ test_usage_errors() {
   has "$(as A acquire "it's" 2>&1)" "invalid resource name"
 }
 
+test_top() {
+  LEASE_HOLDER=orca:pane-1 LEASE_PID=0 LEASE_LABEL='Repo@feature-x' "$LEASE" acquire db >/dev/null
+  as B acquire ci --ttl 1s >/dev/null
+  as C capacity db 2 >/dev/null
+  sleep 2
+  local o; o=$(LEASE_TOP_PANELS= "$LEASE" top --once)
+  has "$o" "RESOURCE"; has "$o" "Repo@feature-x"
+  has "$o" "expired: anyone can take it"
+  has "$o" "RECENT ACTIVITY"; has "$o" "acquire  db#0"
+  case "$o" in *orca:pane-1*) bad "log must show the label, not the holder id";; esac
+  case "$o" in *$'\033'*) bad "no colours when not a tty";; esac
+  # steal shows labels too
+  LEASE_HOLDER=orca:pane-2 LEASE_PID=0 LEASE_LABEL='Repo@other' "$LEASE" acquire ci >/dev/null
+  has "$(LEASE_TOP_PANELS= "$LEASE" top --once)" "from B (ttl)"
+  # panels: output shown, failing / silent panels skipped
+  printf '#!/bin/sh\n[ "$1" = panel ] && echo "MY PANEL" && echo "  line"\n' > "$TMP/p1"
+  printf '#!/bin/sh\nexit 1\n' > "$TMP/p2"; chmod +x "$TMP/p1" "$TMP/p2"
+  o=$(LEASE_TOP_PANELS="$TMP/p1:$TMP/p2" "$LEASE" top --once -n 0)
+  has "$o" "MY PANEL"; has "$o" "  line"
+  case "$o" in *"RECENT ACTIVITY"*) bad "-n 0 hides the log";; esac
+  # empty db
+  has "$(LEASE_DB=$TMP/none.db LEASE_TOP_PANELS= "$LEASE" top --once)" "(no leases yet)"
+  # read-only: a frame does not create a db
+  [ -e "$TMP/none.db" ] && bad "top must not create the db"
+  eq "$(rc "$LEASE" top --bogus)" 1 "bad option"
+}
+
+test_schema_upgrade_v1() {
+  as A acquire db >/dev/null
+  q "DROP TABLE holders; PRAGMA user_version=1;"
+  eq "$(rc as B acquire other)" 0 "acquire on a v1 db"
+  eq "$(q "PRAGMA user_version")" 2 "upgraded"
+  eq "$(q "SELECT label FROM holders WHERE holder='B'")" B "holders filled"
+  eq "$(rc as A renew db)" 0 "old lease still valid"
+}
+
 # ------------------------------------------------- lease-supabase (stubbed) ---
 # docker / lsof / supabase are replaced by stubs that record every call, so
 # these tests never touch real containers.
@@ -504,6 +540,25 @@ test_sb_env_exec_down() {
   grep -q 'supabase stop --project-id toy_lease0 --no-backup' "$FAKE/calls" || bad "down --purge deletes volumes"
   eq "$(rc as A token supabase)" 3 "released"
   eq "$(rc sbx down)" 3 "down without lease -> 3"
+}
+
+test_sb_panel() {
+  sb_setup panel
+  as X capacity supabase 3 >/dev/null
+  ( cd "$PROJ" && H=A sbx up >/dev/null 2>&1 )         # slot 0 held + running
+  printf 'myapp\t/w/exp-main\nold_lease2\t/w/old\n' >> "$FAKE/running"   # unmanaged + warm free slot
+  LEASE_HOLDER=Z LEASE_PID=0 LEASE_LABEL=Z "$LEASE" acquire supabase >/dev/null   # slot 1, no stack
+  : > "$FAKE/calls"
+  local o; o=$("$LSB" panel)
+  has "$o" "SUPABASE STACKS"
+  has "$o" "toy_lease0"; has "$o" "slot 0 · held by proj-panel"
+  has "$o" "myapp"; has "$o" "unmanaged (no lease)"
+  has "$o" "slot 2 · free (warm"
+  has "$o" "(slot 1)"; has "$o" "held by Z but no stack running"
+  # panel never stops anything
+  eq "$(grep -cv '^docker ps ' "$FAKE/calls")" 0 "panel only runs docker ps"
+  # wired into lease top through LEASE_TOP_PANELS
+  has "$(LEASE_TOP_PANELS="$LSB" "$LEASE" top --once)" "unmanaged (no lease)"
 }
 
 # ------------------------------------------------------------------- main ---
