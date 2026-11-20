@@ -412,6 +412,13 @@ test_sb_ports() {
   p=$(LEASE_SUPABASE_PORT_STEP=10 LEASE_SUPABASE_SLOT_OFFSET=1 sbx ports 0)
   has "$p" "SUPABASE_API_PORT=60010"
   p=$(LEASE_SUPABASE_NETWORK= sbx ports 0); case "$p" in *NETWORK*) bad "network disabled";; esac
+  # shared config in the DB, env still wins
+  eq "$(as A resource-meta supabase --set '{"slot_offset":1,"port_step":50}')" '{"slot_offset":1,"port_step":50}' "resource-meta set"
+  has "$(sbx ports 0)" "SUPABASE_API_PORT=60050" "resource meta applies"
+  has "$(LEASE_SUPABASE_SLOT_OFFSET=0 sbx ports 1)" "SUPABASE_API_PORT=60050" "env overrides offset"
+  eq "$(rc as A resource-meta supabase --set 'nope')" 1 "invalid json"
+  as A resource-meta supabase --set '{"slot_offset":"x"}' >/dev/null
+  eq "$(rc sbx ports 0)" 1 "non-integer offset rejected"
 }
 
 test_sb_refuses_foreign_stack_on_ports() {

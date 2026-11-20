@@ -67,6 +67,7 @@ lease token <res>                         → "<token> <slot>" si lo tienes
 lease meta <res> [<token>] --set JSON      (merge en el meta de tu lease)
 lease slot-meta <res> <slot> [--set JSON]  (meta persistente del slot; set exige tenerlo)
 lease capacity <res> [<N>]
+lease resource-meta <res> [--set JSON]   (config compartida del recurso, p. ej. puertos de lease-supabase)
 lease log [<res>] [-n 50]
 lease whoami
 ```
@@ -171,7 +172,7 @@ lease-supabase exec -- <cmd…>          # `supabase` a secas = CLI del proyecto
 lease-supabase ports [<slot>]
 ```
 
-Antes de usarlo: `lease capacity supabase 2` (o los stacks que quepan; default 1).
+Antes de usarlo: `lease capacity supabase 2` (o los stacks que quepan; default 1) y, si hay un stack sin gestionar en los puertos por defecto, `lease resource-meta supabase --set '{"slot_offset":1}'`.
 
 ### Puertos y project_id sin tocar `config.toml` (decisión)
 
@@ -193,8 +194,9 @@ stacks de juguete con el CLI 2.120:
 | red docker (`--network-id`) | `SUPABASE_NETWORK_ID` | `lease-supabase` (compartida) |
 
 Los puertos base salen del `config.toml` del proyecto (si los cambió) o de los
-defaults. Fórmula: `base + (k + LEASE_SUPABASE_SLOT_OFFSET) * LEASE_SUPABASE_PORT_STEP`
-(por defecto 0 y 100).
+defaults. Fórmula: `base + (k + slot_offset) * port_step` (por defecto 0 y 100). Se
+configuran para todos con `lease resource-meta supabase --set '{"slot_offset":1,"port_step":100}'`
+(o por proceso con `LEASE_SUPABASE_SLOT_OFFSET` / `LEASE_SUPABASE_PORT_STEP`).
 
 Descarté:
 - **`env()` en `config.toml`**: obliga a modificar el archivo commiteado.
@@ -237,7 +239,8 @@ los volúmenes.
 
 - **Todo comando `supabase` tiene que ir por `lease-supabase exec`**. Un `supabase db reset` a pelo usa el project_id del config, o sea el stack sin gestionar en los puertos por defecto. Es el riesgo principal y el snippet de CLAUDE.md insiste en ello.
 - Si el proyecto tiene URLs/puertos fijos en `.env*`, el entorno del proceso tiene que ganar. Next.js, Vite y dotenv no sobrescriben variables ya definidas, pero hay que usar los mismos nombres (ver `OVERRIDE_NAMES`).
-- Mientras siga vivo un stack sin gestionar en los puertos por defecto, el slot 0 choca con él: usa `LEASE_SUPABASE_SLOT_OFFSET=1` (slot 0 → +100) o migra ese stack a un slot. **Todos los agentes deben usar los mismos `PORT_STEP`/`SLOT_OFFSET`.**
+- Mientras siga vivo un stack sin gestionar en los puertos por defecto, el slot 0 choca con él. Desplaza los slots para todos los agentes a la vez con
+  `lease resource-meta supabase --set '{"slot_offset":1}'` (slot 0 → +100), o migra ese stack a un slot. La configuración vive en la DB compartida, así que todos usan los mismos `port_step`/`slot_offset`. Las variables `LEASE_SUPABASE_PORT_STEP`/`SLOT_OFFSET` la sobrescriben solo para un proceso.
 - La BD de un slot se comparte entre worktrees del mismo repo (volúmenes por repo × slot). Los datos de prueba de uno pueden verlos otros hasta que haya un reset. Los volúmenes se acumulan como mucho repos × slots; `down --purge` los borra.
 - `auth.site_url` y las redirect URLs del config no se tocan (son puertos de la app, no de Supabase).
 - El `supabase` global de esta máquina (npm, 2.105.0) **muere con SIGKILL** al arrancar (binario con firma ad-hoc). `lease-supabase` usa `node_modules/.bin/supabase` del proyecto, `LEASE_SUPABASE_BIN` o, como último recurso, el del PATH.

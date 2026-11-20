@@ -24,8 +24,9 @@ LEASE=${LEASE_BIN:-$(cd "$(dirname "$self")" && pwd)/lease}
 [ -x "$LEASE" ] || LEASE=$(command -v lease) || die "lease not found"
 
 RES=${LEASE_SUPABASE_RESOURCE:-supabase}
-STEP=${LEASE_SUPABASE_PORT_STEP:-100}
-OFFSET=${LEASE_SUPABASE_SLOT_OFFSET:-0}
+# Port layout: env var > shared resource meta (`lease resource-meta supabase
+# --set '{"port_step":100,"slot_offset":1}'`) > default. Resolved in load_project.
+STEP=${LEASE_SUPABASE_PORT_STEP-} OFFSET=${LEASE_SUPABASE_SLOT_OFFSET-}
 # Shared docker network for every slot stack ("" = Supabase default per-project
 # network). Sharing avoids exhausting docker's address pools.
 NETWORK=${LEASE_SUPABASE_NETWORK-lease-supabase}
@@ -43,6 +44,13 @@ find_root() {
 }
 
 load_project() {
+  if [ -z "$STEP" ] || [ -z "$OFFSET" ]; then
+    local rm; rm=$("$LEASE" resource-meta "$RES" 2>/dev/null) || rm='{}'
+    [ -n "$STEP" ] || STEP=$(json_get "$rm" port_step)
+    [ -n "$OFFSET" ] || OFFSET=$(json_get "$rm" slot_offset)
+    STEP=${STEP:-100} OFFSET=${OFFSET:-0}
+  fi
+  case "$STEP$OFFSET" in *[!0-9]*) die "port_step/slot_offset must be integers (got $STEP/$OFFSET)";; esac
   ROOT=$(find_root) || die "no supabase/config.toml found in $PWD or its parents" "$EX_NOTFOUND"
   CONFIG="$ROOT/supabase/config.toml"
   BASE_ID=$(toml_get '' project_id)
@@ -174,7 +182,7 @@ usage:
 
 slot k: project_id <config project_id>_lease<k>, ports = config ports + k*100
 env: LEASE_SUPABASE_RESOURCE (supabase) LEASE_SUPABASE_PORT_STEP (100)
-     LEASE_SUPABASE_SLOT_OFFSET (0) LEASE_SUPABASE_NETWORK (lease-supabase; '' = off)
+     LEASE_SUPABASE_SLOT_OFFSET (0) — or shared: lease resource-meta supabase --set '{"port_step":100,"slot_offset":1}' LEASE_SUPABASE_NETWORK (lease-supabase; '' = off)
      LEASE_SUPABASE_SUBNET LEASE_SUPABASE_BIN LEASE_SUPABASE_OVERRIDE_NAMES
 exit codes: as lease (2 busy, 3 LOST, 4 timeout) + 1 error
 EOF

@@ -248,6 +248,7 @@ usage:
   lease slot-meta <res> <slot> [--set JSON]
                                          persistent per-slot JSON (set needs the slot)
   lease capacity <res> [<N>]             show/set number of slots (default 1)
+  lease resource-meta <res> [--set JSON]  shared config of a resource (merged)
   lease log [<res>] [-n 50]              history
   lease whoami                           holder id + owner pid and how they were found
 
@@ -560,6 +561,33 @@ cmd_hold() {
   exit 0
 }
 
+# Shared, persistent configuration of a resource (JSON), e.g. lease-supabase's
+# port_step / slot_offset — so every agent uses the same values.
+cmd_resource_meta() {
+  local res=${1-}; valid_res "$res"; shift
+  local set=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) set=${2-}; shift 2;;
+      *) die "unexpected argument: $1";;
+    esac
+  done
+  if [ -n "$set" ]; then
+    ensure_db; valid_json "$set"; init_ctx
+    sql >/dev/null <<SQL || die "database error"
+BEGIN IMMEDIATE;
+INSERT INTO resources(name, capacity, meta) VALUES ($(sq "$res"), 1, json($(sq "$set")))
+  ON CONFLICT(name) DO UPDATE SET meta = json_patch(IFNULL(meta, '{}'), excluded.meta);
+INSERT INTO log(ts, resource, holder, action, detail)
+  VALUES ($(now), $(sq "$res"), $(sq "$HOLDER"), 'meta', $(sq "$set"));
+COMMIT;
+SQL
+  fi
+  local out=''
+  [ -s "$DB" ] && out=$(sql <<<"SELECT meta FROM resources WHERE name=$(sq "$res");")
+  if [ -n "$out" ]; then echo "$out"; else echo "{}"; fi
+}
+
 cmd_capacity() {
   local res=${1-}; valid_res "$res"; local n=${2-}
   ensure_db
@@ -753,6 +781,7 @@ case "$sub" in
   meta)           cmd_meta "$@";;
   slot-meta)      cmd_slot_meta "$@";;
   capacity|cap)   cmd_capacity "$@";;
+  resource-meta)  cmd_resource_meta "$@";;
   log)            cmd_log "$@";;
   whoami)         cmd_whoami "$@";;
   -h|--help|help) usage;;
