@@ -1,0 +1,762 @@
+#!/bin/bash
+# lease — TTL leases / counting semaphore over SQLite for parallel agents.
+#
+# Zero dependencies beyond what macOS ships: bash 3.2, sqlite3 (>= 3.35 for
+# RETURNING/json; macOS ships 3.4x+), ps, date.
+#
+# See README.md for the full protocol. Exit codes (stable):
+#   0 ok · 1 error/usage · 2 busy (no free slot) · 3 LOST (not yours anymore)
+#   4 timeout (wait) · 5 not found
+set -u
+
+LEASE_VERSION=1
+EX_OK=0 EX_ERR=1 EX_BUSY=2 EX_LOST=3 EX_TIMEOUT=4 EX_NOTFOUND=5
+
+DB="${LEASE_DB:-${XDG_STATE_HOME:-$HOME/.local/state}/lease/lease.db}"
+DEFAULT_TTL="${LEASE_TTL:-15m}"
+BUSY_TIMEOUT_MS="${LEASE_BUSY_TIMEOUT_MS:-15000}"
+# Process names (basename of `ps -o comm`) that count as "the agent" when
+# walking up the process tree to find the long-lived owner PID.
+AGENT_PROCS="${LEASE_AGENT_PROCS:-claude}"
+
+prog=lease
+die() { echo "$prog: $*" >&2; exit "$EX_ERR"; }
+warn() { echo "$prog: $*" >&2; }
+
+# ---------------------------------------------------------------- helpers ---
+
+# SQL string literal ('' escaping). Empty string stays ''.
+sq() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+# SQL literal or NULL when empty.
+sqn() { if [ -z "${1-}" ]; then printf 'NULL'; else sq "$1"; fi; }
+
+is_uint() { case "${1-}" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+now() { date +%s; }
+
+# 15m / 30s / 2h / 1d / 900 -> seconds
+parse_dur() {
+  local v=${1-} n u
+  case "$v" in
+    *[0-9]s) n=${v%s}; u=1;;
+    *[0-9]m) n=${v%m}; u=60;;
+    *[0-9]h) n=${v%h}; u=3600;;
+    *[0-9]d) n=${v%d}; u=86400;;
+    *) n=$v; u=1;;
+  esac
+  is_uint "$n" || die "invalid duration: '$v' (use e.g. 90s, 15m, 2h)"
+  echo $((n * u))
+}
+
+fmt_dur() { # seconds -> 1h02m / 12m03s / 45s
+  local s=$1 neg=''
+  [ "$s" -lt 0 ] && { neg='-'; s=$((-s)); }
+  if [ "$s" -ge 3600 ]; then printf '%s%dh%02dm' "$neg" $((s/3600)) $((s%3600/60))
+  elif [ "$s" -ge 60 ]; then printf '%s%dm%02ds' "$neg" $((s/60)) $((s%60))
+  else printf '%s%ds' "$neg" "$s"; fi
+}
+
+# Run SQL from stdin against the DB. Tab-separated, no headers.
+sql() {
+  sqlite3 -batch -bail -noheader -separator "$(printf '\t')" -cmd ".timeout $BUSY_TIMEOUT_MS" "$@" "$DB"
+}
+
+# Process start time; used together with the PID to defeat PID reuse.
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+
+# Find the long-lived "owner" process for leases taken from this process.
+#   1. LEASE_PID (0 disables PID liveness: TTL only)
+#   2. CLAUDE_PID if set and alive (Claude Code exports it to Bash tool + hooks)
+#   3. nearest ancestor whose command basename is in LEASE_AGENT_PROCS
+#   4. the caller ($PPID): an interactive shell, a script…
+# Prints "PID<TAB>how".
+owner_pid() {
+  if [ -n "${LEASE_PID-}" ]; then
+    is_uint "$LEASE_PID" || die "LEASE_PID must be a number"
+    printf '%s\tLEASE_PID\n' "$LEASE_PID"; return
+  fi
+  if [ -n "${CLAUDE_PID-}" ] && is_uint "$CLAUDE_PID" && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    printf '%s\tCLAUDE_PID\n' "$CLAUDE_PID"; return
+  fi
+  local found
+  found=$(ps -A -o pid=,ppid=,comm= 2>/dev/null | awk -v start="$$" -v names="$AGENT_PROCS" '
+    BEGIN { n = split(names, want, /[ ,]+/) }
+    { pid=$1; ppid[pid]=$2; c=$3; for (i=4;i<=NF;i++) c=c" "$i; sub(/.*\//, "", c); comm[pid]=c }
+    END {
+      p = ppid[start]
+      while (p != "" && p > 1) {
+        for (i=1;i<=n;i++) if (want[i] != "" && comm[p] == want[i]) { print p; exit }
+        p = ppid[p]
+      }
+    }')
+  if [ -n "$found" ]; then printf '%s\tancestor\n' "$found"; return; fi
+  printf '%s\tPPID\n' "$PPID"
+}
+
+# Holder identity: stable per agent session.
+# Prints "holder<TAB>source".
+holder_id() {
+  if [ -n "${LEASE_HOLDER-}" ]; then printf '%s\tLEASE_HOLDER\n' "$LEASE_HOLDER"
+  elif [ -n "${ORCA_PANE_KEY-}" ]; then printf 'orca:%s\tORCA_PANE_KEY\n' "$ORCA_PANE_KEY"
+  elif [ -n "${ORCA_TERMINAL_HANDLE-}" ]; then printf 'orca:%s\tORCA_TERMINAL_HANDLE\n' "$ORCA_TERMINAL_HANDLE"
+  elif [ -n "${CLAUDE_CODE_SESSION_ID-}" ]; then printf 'claude:%s\tCLAUDE_CODE_SESSION_ID\n' "$CLAUDE_CODE_SESSION_ID"
+  else
+    local p; p=$(owner_pid | cut -f1)
+    printf 'pid:%s:%s:%s\tpid+cwd\n' "$(hostname -s 2>/dev/null || echo host)" "$p" "$PWD"
+  fi
+}
+
+# Human label: where the holder works (worktree dir basename + branch).
+holder_label() {
+  if [ -n "${LEASE_LABEL-}" ]; then echo "$LEASE_LABEL"; return; fi
+  local dir=$PWD br
+  if [ -n "${ORCA_WORKTREE_ID-}" ] && [ "${ORCA_WORKTREE_ID#*::}" != "$ORCA_WORKTREE_ID" ]; then
+    dir=${ORCA_WORKTREE_ID#*::}
+  fi
+  br=$(git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null)
+  if [ -n "$br" ]; then echo "$(basename "$dir")@$br"; else basename "$dir"; fi
+}
+
+init_ctx() {
+  IFS=$'\t' read -r HOLDER HOLDER_SRC <<EOF
+$(holder_id)
+EOF
+  IFS=$'\t' read -r OWNER OWNER_SRC <<EOF
+$(owner_pid)
+EOF
+  OWNER_START=''
+  [ "$OWNER" != 0 ] && OWNER_START=$(proc_start "$OWNER")
+  LABEL=$(holder_label)
+}
+
+ensure_db() {
+  if [ -s "$DB" ] && [ "$(sql <<<'PRAGMA user_version;')" = "$LEASE_VERSION" ]; then return; fi
+  mkdir -p "$(dirname "$DB")" || die "cannot create $(dirname "$DB")"
+  sql >/dev/null <<'SQL' || die "cannot initialise $DB"
+PRAGMA journal_mode=WAL;
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS resources(
+  name       TEXT PRIMARY KEY,
+  capacity   INTEGER NOT NULL DEFAULT 1 CHECK (capacity >= 1),
+  meta       TEXT
+);
+CREATE TABLE IF NOT EXISTS leases(
+  resource    TEXT    NOT NULL,
+  slot        INTEGER NOT NULL,
+  holder      TEXT    NOT NULL,
+  label       TEXT,
+  token       TEXT    NOT NULL UNIQUE,
+  pid         INTEGER,            -- owner process; 0/NULL = TTL only
+  pid_start   TEXT,               -- `ps -o lstart` of pid, defeats PID reuse
+  ttl         INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL,
+  renewed_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  meta        TEXT,
+  PRIMARY KEY (resource, slot)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS leases_res_holder ON leases(resource, holder);
+CREATE INDEX IF NOT EXISTS leases_holder ON leases(holder);
+-- Persistent per-slot data that outlives leases (e.g. what is running there).
+CREATE TABLE IF NOT EXISTS slots(
+  resource   TEXT    NOT NULL,
+  slot       INTEGER NOT NULL,
+  meta       TEXT,
+  updated_at INTEGER,
+  PRIMARY KEY (resource, slot)
+);
+CREATE TABLE IF NOT EXISTS log(
+  id       INTEGER PRIMARY KEY,
+  ts       INTEGER NOT NULL,
+  resource TEXT,
+  slot     INTEGER,
+  holder   TEXT,
+  action   TEXT NOT NULL,   -- acquire renew release steal expire lost capacity meta
+  detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS log_res ON log(resource, id);
+-- Pending "you lost your lease" notices, delivered by `renew-mine --hook`.
+CREATE TABLE IF NOT EXISTS lost(
+  holder   TEXT NOT NULL,
+  pid      INTEGER,
+  resource TEXT NOT NULL,
+  slot     INTEGER,
+  ts       INTEGER NOT NULL,
+  detail   TEXT
+);
+PRAGMA user_version=1;
+COMMIT;
+SQL
+}
+
+# Tokens of leases whose owner process is gone (PID dead or reused), as a SQL
+# list literal: ('t1','t2') — or ('') when none. Optional resource filter.
+dead_tokens() {
+  local where='' rows tok pid st alive list=''
+  [ -n "${1-}" ] && where="WHERE resource=$(sq "$1")"
+  rows=$(sql <<<"SELECT token, pid, IFNULL(pid_start,'') FROM leases $where;") || return 1
+  [ -z "$rows" ] && { echo "('')"; return; }
+  local pids
+  pids=$(printf '%s\n' "$rows" | awk -F'\t' '$2>0{print $2}' | sort -u | paste -sd, -)
+  # pid<TAB>lstart for every live owner pid, in one ps call
+  if [ -n "$pids" ]; then
+    alive=$(ps -o pid=,lstart= -p "$pids" 2>/dev/null | awk '{p=$1; $1=""; sub(/^ +/,""); print p "\t" $0}')
+  else
+    alive=''
+  fi
+  while IFS=$'\t' read -r tok pid st; do
+    [ -z "$tok" ] && continue
+    { [ -z "$pid" ] || [ "$pid" = 0 ]; } && continue
+    local cur
+    cur=$(printf '%s\n' "$alive" | awk -F'\t' -v p="$pid" '$1==p{print $2; exit}')
+    if [ -z "$cur" ] || { [ -n "$st" ] && [ "$cur" != "$st" ]; }; then
+      list="$list,$(sq "$tok")"
+    fi
+  done <<EOF
+$rows
+EOF
+  if [ -z "$list" ]; then echo "('')"; else echo "(${list#,})"; fi
+}
+
+valid_res() {
+  case "${1-}" in
+    ''|-*) die "missing resource name";;
+    *[!A-Za-z0-9._:/@+-]*) die "invalid resource name '$1' (allowed: A-Z a-z 0-9 . _ : / @ + -)";;
+  esac
+}
+
+valid_json() {
+  [ -z "${1-}" ] && return 0
+  [ "$(sql <<<"SELECT json_valid($(sq "$1"));")" = 1 ] || die "invalid JSON: $1"
+}
+
+# ------------------------------------------------------------- commands ---
+
+usage() {
+  cat <<'EOF'
+lease — shared-resource leases (TTL + fencing tokens) for parallel agents
+
+usage:
+  lease ls [<res>] [--json] [--mine]     state of every resource/slot
+  lease acquire <res> [--ttl 15m] [--meta JSON] [--json]
+                                         prints "<token> <slot>"; exit 2 if busy
+  lease wait <res> [--timeout 30m] [--interval 5s] [acquire opts]
+                                         poll until acquired; exit 4 on timeout
+  lease renew <res> [<token>] [--ttl D]  exit 3 (LOST) if it is not yours anymore
+  lease release <res> [<token>]          exit 3 if it was not yours anymore
+  lease hold <res> [<token>] [--pid P] [--interval D] [-- cmd args...]
+                                         keep renewing while P (default: caller)
+                                         or cmd lives; exit 3 on LOST
+  lease renew-mine [--hook]              renew all leases of this holder (hook)
+  lease token <res>                      print "<token> <slot>" if you hold it
+  lease meta <res> [<token>] --set JSON  merge JSON into your lease's meta
+  lease slot-meta <res> <slot> [--set JSON]
+                                         persistent per-slot JSON (set needs the slot)
+  lease capacity <res> [<N>]             show/set number of slots (default 1)
+  lease log [<res>] [-n 50]              history
+  lease whoami                           holder id + owner pid and how they were found
+
+exit codes: 0 ok · 1 error · 2 busy · 3 LOST · 4 timeout · 5 not found
+env: LEASE_DB LEASE_HOLDER LEASE_PID LEASE_LABEL LEASE_TTL LEASE_AGENT_PROCS
+EOF
+}
+
+cmd_whoami() {
+  init_ctx
+  printf 'holder\t%s\t(from %s)\n' "$HOLDER" "$HOLDER_SRC"
+  printf 'owner_pid\t%s\t(from %s)\t%s\n' "$OWNER" "$OWNER_SRC" "$OWNER_START"
+  printf 'label\t%s\n' "$LABEL"
+  printf 'db\t%s\n' "$DB"
+}
+
+# Core acquire. Sets ACQ_STATUS (ok|renewed|busy), ACQ_TOKEN, ACQ_SLOT,
+# ACQ_EXPIRES, ACQ_BUSY (who holds it, for messages).
+do_acquire() {
+  local res=$1 ttl=$2 meta=$3 t dead out
+  t=$(now)
+  dead=$(dead_tokens "$res") || die "database error"
+  out=$(sql <<SQL
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO resources(name, capacity) VALUES ($(sq "$res"), 1);
+CREATE TEMP TABLE reaped AS
+  SELECT resource, slot, holder, pid, token,
+         CASE WHEN expires_at <= $t THEN 'ttl' ELSE 'pid' END AS why
+  FROM leases
+  WHERE resource = $(sq "$res") AND holder <> $(sq "$HOLDER")
+    AND (expires_at <= $t OR token IN $dead);
+DELETE FROM leases WHERE token IN (SELECT token FROM reaped);
+CREATE TEMP TABLE st AS SELECT EXISTS(
+  SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER")) AS mine;
+UPDATE leases SET ttl = $ttl, renewed_at = $t, expires_at = $t + $ttl,
+       pid = $OWNER, pid_start = $(sqn "$OWNER_START"), label = $(sq "$LABEL"),
+       meta = CASE WHEN $(sqn "$meta") IS NULL THEN meta
+                   ELSE json_patch(IFNULL(meta,'{}'), $(sqn "$meta")) END
+  WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER");
+INSERT INTO leases(resource, slot, holder, label, token, pid, pid_start, ttl,
+                   acquired_at, renewed_at, expires_at, meta)
+  SELECT $(sq "$res"), k, $(sq "$HOLDER"), $(sq "$LABEL"), lower(hex(randomblob(12))),
+         $OWNER, $(sqn "$OWNER_START"), $ttl, $t, $t, $t + $ttl,
+         CASE WHEN $(sqn "$meta") IS NULL THEN NULL ELSE json($(sqn "$meta")) END
+  FROM (
+    WITH RECURSIVE s(k) AS (
+      SELECT 0 UNION ALL SELECT k + 1 FROM s
+      WHERE k + 1 < (SELECT capacity FROM resources WHERE name = $(sq "$res")))
+    SELECT k FROM s
+    WHERE k NOT IN (SELECT slot FROM leases WHERE resource = $(sq "$res"))
+    ORDER BY k LIMIT 1)
+  WHERE (SELECT mine FROM st) = 0;
+-- bookkeeping for reaped leases
+INSERT INTO log(ts, resource, slot, holder, action, detail)
+  SELECT $t, resource, slot, holder, 'expire', 'reaped (' || why || ') by ' || $(sq "$LABEL") FROM reaped;
+INSERT INTO lost(holder, pid, resource, slot, ts, detail)
+  SELECT holder, pid, resource, slot, $t,
+         'lease expired (' || why || ') and was reaped by ' || $(sq "$LABEL") FROM reaped;
+INSERT INTO log(ts, resource, slot, holder, action, detail)
+  SELECT $t, l.resource, l.slot, l.holder,
+         CASE WHEN st.mine THEN 'renew'
+              WHEN r.holder IS NOT NULL THEN 'steal'
+              ELSE 'acquire' END,
+         CASE WHEN st.mine THEN 're-acquire (idempotent)'
+              WHEN r.holder IS NOT NULL THEN 'from ' || r.holder || ' (' || r.why || ')'
+              ELSE 'ttl=' || l.ttl END
+  FROM leases l CROSS JOIN st LEFT JOIN reaped r ON r.slot = l.slot
+  WHERE l.resource = $(sq "$res") AND l.holder = $(sq "$HOLDER");
+SELECT CASE WHEN st.mine THEN 'renewed' ELSE 'ok' END, token, slot, expires_at
+  FROM leases CROSS JOIN st WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER");
+SELECT 'busy', '', '', '' WHERE NOT EXISTS (
+  SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER"));
+COMMIT;
+SQL
+) || die "database error during acquire"
+  IFS=$'\t' read -r ACQ_STATUS ACQ_TOKEN ACQ_SLOT ACQ_EXPIRES <<EOF
+$out
+EOF
+  ACQ_BUSY=''
+  if [ "$ACQ_STATUS" = busy ]; then
+    ACQ_BUSY=$(sql <<SQL
+SELECT 'slot ' || slot || ': ' || IFNULL(label, holder) || ' (' || holder || '), '
+       || CASE WHEN expires_at > $t THEN (expires_at - $t) || 's left' ELSE 'expired' END
+  FROM leases WHERE resource = $(sq "$res") ORDER BY slot;
+SQL
+)
+  fi
+}
+
+print_acquired() { # res json?
+  if [ "$2" = 1 ]; then
+    sql <<SQL
+SELECT json_object('resource', resource, 'slot', slot, 'token', token, 'holder', holder,
+  'label', label, 'pid', pid, 'acquired_at', acquired_at, 'expires_at', expires_at,
+  'ttl', ttl, 'meta', json(IFNULL(meta, 'null')), 'status', $(sq "$ACQ_STATUS"))
+  FROM leases WHERE token = $(sq "$ACQ_TOKEN");
+SQL
+  else
+    echo "$ACQ_TOKEN $ACQ_SLOT"
+  fi
+}
+
+parse_acquire_opts() { # sets OPT_TTL OPT_META OPT_JSON, REST
+  OPT_TTL=$(parse_dur "$DEFAULT_TTL"); OPT_META=''; OPT_JSON=0; REST=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ttl) OPT_TTL=$(parse_dur "${2-}") || exit 1; shift 2;;
+      --ttl=*) OPT_TTL=$(parse_dur "${1#*=}") || exit 1; shift;;
+      --meta) OPT_META=${2-}; shift 2;;
+      --meta=*) OPT_META=${1#*=}; shift;;
+      --json) OPT_JSON=1; shift;;
+      *) REST+=("$1"); shift;;
+    esac
+  done
+  [ "$OPT_TTL" -ge 1 ] || die "--ttl must be >= 1s"
+}
+
+cmd_acquire() {
+  local res=${1-}; valid_res "$res"; shift
+  parse_acquire_opts "$@"
+  [ ${#REST[@]} -eq 0 ] || die "unexpected argument: ${REST[0]}"
+  ensure_db; init_ctx; valid_json "$OPT_META"
+  do_acquire "$res" "$OPT_TTL" "$OPT_META"
+  if [ "$ACQ_STATUS" = busy ]; then
+    echo "BUSY $res" >&2
+    printf '%s\n' "$ACQ_BUSY" | sed 's/^/  /' >&2
+    exit "$EX_BUSY"
+  fi
+  print_acquired "$res" "$OPT_JSON"
+}
+
+cmd_wait() {
+  local res=${1-}; valid_res "$res"; shift
+  local timeout interval args=()
+  timeout=$(parse_dur 30m); interval=$(parse_dur 5s)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout=$(parse_dur "${2-}") || exit 1; shift 2;;
+      --interval) interval=$(parse_dur "${2-}") || exit 1; shift 2;;
+      *) args+=("$1"); shift;;
+    esac
+  done
+  parse_acquire_opts ${args[@]+"${args[@]}"}
+  [ ${#REST[@]} -eq 0 ] || die "unexpected argument: ${REST[0]}"
+  ensure_db; init_ctx; valid_json "$OPT_META"
+  local deadline=$(( $(now) + timeout )) said=0
+  while :; do
+    do_acquire "$res" "$OPT_TTL" "$OPT_META"
+    if [ "$ACQ_STATUS" != busy ]; then print_acquired "$res" "$OPT_JSON"; return 0; fi
+    if [ "$said" = 0 ]; then
+      echo "waiting for $res (timeout $(fmt_dur "$timeout")):" >&2
+      printf '%s\n' "$ACQ_BUSY" | sed 's/^/  /' >&2; said=1
+    fi
+    [ "$(now)" -ge "$deadline" ] && { echo "TIMEOUT waiting for $res" >&2; exit "$EX_TIMEOUT"; }
+    # jitter 0-999ms so N waiters don't stampede in lockstep
+    sleep "$interval.$(( RANDOM % 1000 ))" 2>/dev/null || sleep "$interval"
+  done
+}
+
+# Resolve the caller's token for <res> when not given. Exit 3 if none.
+my_token() {
+  local tok
+  tok=$(sql <<<"SELECT token FROM leases WHERE resource=$(sq "$1") AND holder=$(sq "$HOLDER");")
+  [ -n "$tok" ] || { echo "LOST $1: you hold no lease on it (holder $HOLDER)" >&2; exit "$EX_LOST"; }
+  echo "$tok"
+}
+
+cmd_renew() {
+  local res=${1-}; valid_res "$res"; shift
+  local tok='' ttl='' quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ttl) ttl=$(parse_dur "${2-}") || exit 1; shift 2;;
+      --ttl=*) ttl=$(parse_dur "${1#*=}") || exit 1; shift;;
+      -q|--quiet) quiet=1; shift;;
+      -*) die "unknown option $1";;
+      *) [ -z "$tok" ] || die "unexpected argument: $1"; tok=$1; shift;;
+    esac
+  done
+  ensure_db; init_ctx
+  [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
+  local t out; t=$(now)
+  out=$(sql <<SQL
+BEGIN IMMEDIATE;
+UPDATE leases SET ttl = IFNULL($(sqn "$ttl"), ttl), renewed_at = $t,
+       expires_at = $t + IFNULL($(sqn "$ttl"), ttl)
+  WHERE resource = $(sq "$res") AND token = $(sq "$tok");
+INSERT INTO log(ts, resource, slot, holder, action, detail)
+  SELECT $t, resource, slot, holder, 'renew', 'ttl=' || ttl FROM leases
+  WHERE resource = $(sq "$res") AND token = $(sq "$tok");
+SELECT slot, expires_at FROM leases WHERE resource = $(sq "$res") AND token = $(sq "$tok");
+COMMIT;
+SQL
+) || die "database error during renew"
+  if [ -z "$out" ]; then
+    sql >/dev/null <<<"INSERT INTO log(ts,resource,holder,action,detail) VALUES ($t,$(sq "$res"),$(sq "$HOLDER"),'lost','renew with stale token');"
+    echo "LOST $res: token is no longer valid (expired and taken, or released)" >&2
+    exit "$EX_LOST"
+  fi
+  [ "$quiet" = 1 ] || { local slot exp; IFS=$'\t' read -r slot exp <<<"$out"; echo "OK $res slot $slot until $(date -r "$exp" '+%H:%M:%S')"; }
+}
+
+cmd_release() {
+  local res=${1-}; valid_res "$res"; shift
+  local tok=${1-}
+  ensure_db; init_ctx
+  [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
+  local t out; t=$(now)
+  out=$(sql <<SQL
+BEGIN IMMEDIATE;
+INSERT INTO log(ts, resource, slot, holder, action, detail)
+  SELECT $t, resource, slot, holder, 'release', 'held ' || ($t - acquired_at) || 's'
+  FROM leases WHERE resource = $(sq "$res") AND token = $(sq "$tok");
+DELETE FROM leases WHERE resource = $(sq "$res") AND token = $(sq "$tok") RETURNING slot;
+COMMIT;
+SQL
+) || die "database error during release"
+  if [ -z "$out" ]; then
+    echo "LOST $res: token is no longer valid (nothing released)" >&2
+    exit "$EX_LOST"
+  fi
+  echo "RELEASED $res slot $out"
+}
+
+cmd_token() {
+  local res=${1-}; valid_res "$res"
+  ensure_db; init_ctx
+  local out
+  out=$(sql <<<"SELECT token || ' ' || slot FROM leases WHERE resource=$(sq "$res") AND holder=$(sq "$HOLDER");")
+  [ -n "$out" ] || { echo "you hold no lease on $res" >&2; exit "$EX_LOST"; }
+  echo "$out"
+}
+
+# Renew every lease held by this holder *and* owned by this agent process.
+# Designed for a Claude Code hook: fast, silent, never fails.
+cmd_renew_mine() {
+  local hook=0
+  [ "${1-}" = --hook ] && hook=1
+  [ -s "$DB" ] || exit 0
+  init_ctx
+  local t; t=$(now)
+  # Leases whose owner PID differs (e.g. a previous agent in the same Orca
+  # pane) are deliberately NOT renewed: they die by PID check.
+  local mine="holder = $(sq "$HOLDER") AND (pid IS NULL OR pid = 0 OR pid = $OWNER)"
+  local out
+  out=$(sql <<SQL 2>/dev/null
+BEGIN IMMEDIATE;
+UPDATE leases SET renewed_at = $t, expires_at = $t + ttl WHERE $mine;
+DELETE FROM lost WHERE holder = $(sq "$HOLDER") AND (pid IS NULL OR pid = 0 OR pid = $OWNER)
+  RETURNING resource || ' slot ' || IFNULL(slot, '?') || ': ' || detail
+            || ' at ' || strftime('%H:%M:%S', ts, 'unixepoch', 'localtime');
+COMMIT;
+SQL
+) || exit 0
+  [ -z "$out" ] && exit 0
+  local msg
+  msg="lease: you LOST these leases — stop using the resource(s) now and acquire again before touching them: $(printf '%s' "$out" | paste -sd ';' -)"
+  if [ "$hook" = 1 ]; then
+    local event=${LEASE_HOOK_EVENT:-PostToolUse}
+    sql <<<"SELECT json_object('hookSpecificOutput', json_object('hookEventName', $(sq "$event"), 'additionalContext', $(sq "$msg")), 'systemMessage', $(sq "$msg"));" 2>/dev/null
+    exit 0
+  fi
+  echo "$msg" >&2
+  exit "$EX_LOST"
+}
+
+cmd_hold() {
+  local res=${1-}; valid_res "$res"; shift
+  local tok='' pid=$PPID interval='' cmd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pid) pid=${2-}; shift 2;;
+      --interval) interval=$(parse_dur "${2-}") || exit 1; shift 2;;
+      --) shift; cmd=("$@"); break;;
+      -*) die "unknown option $1";;
+      *) [ -z "$tok" ] || die "unexpected argument: $1"; tok=$1; shift;;
+    esac
+  done
+  is_uint "$pid" || die "--pid must be a number"
+  ensure_db; init_ctx
+  [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
+  local ttl
+  ttl=$(sql <<<"SELECT ttl FROM leases WHERE resource=$(sq "$res") AND token=$(sq "$tok");")
+  [ -n "$ttl" ] || { echo "LOST $res: token is no longer valid" >&2; exit "$EX_LOST"; }
+  [ -n "$interval" ] || interval=$(( ttl / 3 )); [ "$interval" -ge 1 ] || interval=1
+
+  local child=''
+  if [ ${#cmd[@]} -gt 0 ]; then
+    "${cmd[@]}" & child=$!
+    pid=$child
+    trap '[ -n "$child" ] && kill "$child" 2>/dev/null' INT TERM
+  fi
+  local rc=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if ! "$0" renew "$res" "$tok" -q 2>/dev/null; then
+      rc=$?
+      if [ "$rc" = "$EX_LOST" ]; then
+        echo "LOST $res while holding it — stopping" >&2
+        [ -n "$child" ] && kill "$child" 2>/dev/null
+        exit "$EX_LOST"
+      fi
+    fi
+    # sleep in 1s steps so we notice the process ending promptly
+    local i=0
+    while [ "$i" -lt "$interval" ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
+  done
+  if [ -n "$child" ]; then wait "$child"; exit $?; fi
+  exit 0
+}
+
+cmd_capacity() {
+  local res=${1-}; valid_res "$res"; local n=${2-}
+  ensure_db
+  if [ -z "$n" ]; then
+    local c; c=$(sql <<<"SELECT capacity FROM resources WHERE name=$(sq "$res");")
+    echo "${c:-1}"; return
+  fi
+  is_uint "$n" && [ "$n" -ge 1 ] || die "capacity must be an integer >= 1"
+  init_ctx
+  sql >/dev/null <<SQL || die "database error"
+BEGIN IMMEDIATE;
+INSERT INTO resources(name, capacity) VALUES ($(sq "$res"), $n)
+  ON CONFLICT(name) DO UPDATE SET capacity = excluded.capacity;
+INSERT INTO log(ts, resource, holder, action, detail)
+  VALUES ($(now), $(sq "$res"), $(sq "$HOLDER"), 'capacity', 'capacity=$n');
+COMMIT;
+SQL
+  echo "$res capacity $n"
+  local over
+  over=$(sql <<<"SELECT group_concat(slot) FROM leases WHERE resource=$(sq "$res") AND slot >= $n;")
+  [ -n "$over" ] && warn "slots $over are >= new capacity; they stay held until released/expired"
+  return 0
+}
+
+cmd_meta() {
+  local res=${1-}; valid_res "$res"; shift
+  local tok='' set=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) set=${2-}; shift 2;;
+      -*) die "unknown option $1";;
+      *) tok=$1; shift;;
+    esac
+  done
+  ensure_db; init_ctx
+  [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
+  if [ -n "$set" ]; then
+    valid_json "$set"
+    sql >/dev/null <<SQL || die "database error"
+UPDATE leases SET meta = json_patch(IFNULL(meta,'{}'), $(sq "$set"))
+  WHERE resource = $(sq "$res") AND token = $(sq "$tok");
+SQL
+  fi
+  local out
+  out=$(sql <<<"SELECT IFNULL(meta,'{}') FROM leases WHERE resource=$(sq "$res") AND token=$(sq "$tok");")
+  [ -n "$out" ] || { echo "LOST $res: token is no longer valid" >&2; exit "$EX_LOST"; }
+  echo "$out"
+}
+
+cmd_slot_meta() {
+  local res=${1-}; valid_res "$res"; local slot=${2-}
+  is_uint "$slot" || die "usage: lease slot-meta <res> <slot> [--set JSON] [--token T]"
+  shift 2
+  local set='' tok=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) set=${2-}; shift 2;;
+      --token) tok=${2-}; shift 2;;
+      *) die "unexpected argument: $1";;
+    esac
+  done
+  ensure_db
+  if [ -n "$set" ]; then
+    init_ctx; valid_json "$set"
+    local cond
+    if [ -n "$tok" ]; then cond="token = $(sq "$tok")"; else cond="holder = $(sq "$HOLDER")"; fi
+    local ok
+    ok=$(sql <<SQL
+BEGIN IMMEDIATE;
+INSERT INTO slots(resource, slot, meta, updated_at)
+  SELECT $(sq "$res"), $slot, json($(sq "$set")), $(now)
+  WHERE EXISTS (SELECT 1 FROM leases WHERE resource = $(sq "$res") AND slot = $slot AND $cond)
+  ON CONFLICT(resource, slot) DO UPDATE
+    SET meta = json_patch(IFNULL(meta,'{}'), excluded.meta), updated_at = excluded.updated_at;
+SELECT changes();
+COMMIT;
+SQL
+) || die "database error"
+    [ "$ok" = 1 ] || { echo "LOST $res: you do not hold slot $slot" >&2; exit "$EX_LOST"; }
+  fi
+  local out
+  out=$(sql <<<"SELECT meta FROM slots WHERE resource=$(sq "$res") AND slot=$slot;")
+  if [ -n "$out" ]; then echo "$out"; else echo "{}"; fi
+}
+
+cmd_ls() {
+  local json=0 res='' mine=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift;;
+      --mine) mine=1; shift;;
+      -*) die "unknown option $1";;
+      *) res=$1; shift;;
+    esac
+  done
+  [ -s "$DB" ] || { [ "$json" = 1 ] && echo '[]' || echo "(no leases yet — db: $DB)"; return 0; }
+  ensure_db
+  local t dead filter='1'
+  t=$(now)
+  dead=$(dead_tokens) || die "database error"
+  [ -n "$res" ] && filter="r.name = $(sq "$res")"
+  if [ "$mine" = 1 ]; then init_ctx; filter="$filter AND l.holder = $(sq "$HOLDER")"; fi
+  local q
+  q=$(cat <<SQL
+WITH RECURSIVE
+  allres AS (SELECT name, capacity FROM resources
+             UNION SELECT DISTINCT resource, 1 FROM leases WHERE resource NOT IN (SELECT name FROM resources)),
+  maxslot AS (SELECT a.name, MAX(a.capacity - 1, IFNULL((SELECT MAX(slot) FROM leases WHERE resource = a.name), 0)) AS m FROM allres a),
+  s(name, k) AS (SELECT name, 0 FROM maxslot UNION ALL SELECT s.name, k + 1 FROM s JOIN maxslot USING (name) WHERE k < m)
+SELECT r.name AS resource, s.k AS slot, r.capacity AS capacity,
+       CASE WHEN l.token IS NULL THEN 'free'
+            WHEN l.token IN $dead THEN 'dead'
+            WHEN l.expires_at <= $t THEN 'expired'
+            ELSE 'held' END AS state,
+       l.holder AS holder, l.label AS label, l.pid AS pid,
+       l.acquired_at AS acquired_at, l.expires_at AS expires_at,
+       CASE WHEN l.token IS NULL THEN NULL ELSE l.expires_at - $t END AS left_s,
+       l.meta AS meta, sl.meta AS slot_meta
+FROM s JOIN allres r ON r.name = s.name
+  LEFT JOIN leases l ON l.resource = s.name AND l.slot = s.k
+  LEFT JOIN slots sl ON sl.resource = s.name AND sl.slot = s.k
+WHERE $filter
+ORDER BY r.name, s.k
+SQL
+)
+  if [ "$json" = 1 ]; then
+    local o; o=$(sqlite3 -json -cmd ".timeout $BUSY_TIMEOUT_MS" "$DB" "$q;") || die "database error"
+    echo "${o:-[]}"; return
+  fi
+  local rows; rows=$(sql <<<"$q;") || die "database error"
+  [ -z "$rows" ] && { echo "(nothing)"; return; }
+  printf '%-14s %4s %-8s %-28s %7s %-9s %-9s %s\n' RESOURCE SLOT STATE HOLDER PID SINCE LEFT META
+  local name slot cap state holder label pid acq exp left meta smeta
+  while IFS=$'\t' read -r name slot cap state holder label pid acq exp left meta smeta; do
+    local who='-' since='-' l='-' m=''
+    if [ "$state" != free ]; then
+      who=${label:-$holder}
+      since=$(date -r "$acq" '+%H:%M:%S')
+      if [ "$left" -gt 0 ]; then l=$(fmt_dur "$left"); else l="-$(fmt_dur $((-left)))"; fi
+      m=$meta
+    else
+      pid='-'
+      [ -n "$smeta" ] && m="(last: $smeta)"
+    fi
+    [ "$slot" -ge "$cap" ] && state="$state*"
+    [ ${#m} -gt 80 ] && m="${m:0:77}..."
+    printf '%-14s %4s %-8s %-28s %7s %-9s %-9s %s\n' "$name" "$slot" "$state" "${who:0:28}" "${pid:--}" "$since" "$l" "$m"
+  done <<EOF
+$rows
+EOF
+}
+
+cmd_log() {
+  local res='' n=50
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) n=${2-}; shift 2;;
+      -n*) n=${1#-n}; shift;;
+      -*) die "unknown option $1";;
+      *) res=$1; shift;;
+    esac
+  done
+  is_uint "$n" || die "-n must be a number"
+  [ -s "$DB" ] || return 0
+  ensure_db
+  local where=''
+  [ -n "$res" ] && where="WHERE resource = $(sq "$res")"
+  sql <<SQL
+SELECT * FROM (
+  SELECT id, strftime('%m-%d %H:%M:%S', ts, 'unixepoch', 'localtime'), IFNULL(resource,'-'),
+         IFNULL(slot,'-'), action, holder, IFNULL(detail,'')
+  FROM log $where ORDER BY id DESC LIMIT $n) ORDER BY id;
+SQL
+}
+
+# ------------------------------------------------------------------ main ---
+
+command -v sqlite3 >/dev/null || die "sqlite3 not found"
+[ $# -gt 0 ] || { usage; exit "$EX_ERR"; }
+sub=$1; shift
+case "$sub" in
+  ls|list|status) cmd_ls "$@";;
+  acquire|get)    cmd_acquire "$@";;
+  wait)           cmd_wait "$@";;
+  renew)          cmd_renew "$@";;
+  release|rel)    cmd_release "$@";;
+  hold)           cmd_hold "$@";;
+  renew-mine)     cmd_renew_mine "$@";;
+  token)          cmd_token "$@";;
+  meta)           cmd_meta "$@";;
+  slot-meta)      cmd_slot_meta "$@";;
+  capacity|cap)   cmd_capacity "$@";;
+  log)            cmd_log "$@";;
+  whoami)         cmd_whoami "$@";;
+  -h|--help|help) usage;;
+  *) usage >&2; exit "$EX_ERR";;
+esac
