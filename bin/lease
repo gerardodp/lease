@@ -58,7 +58,7 @@ fmt_dur() { # seconds -> 1h02m / 12m03s / 45s
 
 # Run SQL from stdin against the DB. Tab-separated, no headers.
 sql() {
-  sqlite3 -batch -bail -noheader -separator "$(printf '\t')" -cmd ".timeout $BUSY_TIMEOUT_MS" "$@" "$DB"
+  sqlite3 -batch -bail -noheader -separator $'\t' -cmd ".timeout $BUSY_TIMEOUT_MS" "$@" "$DB"
 }
 
 # Process start time; used together with the PID to defeat PID reuse.
@@ -69,14 +69,14 @@ proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }
 #   2. CLAUDE_PID if set and alive (Claude Code exports it to Bash tool + hooks)
 #   3. nearest ancestor whose command basename is in LEASE_AGENT_PROCS
 #   4. the caller ($PPID): an interactive shell, a script…
-# Prints "PID<TAB>how".
-owner_pid() {
+# Sets OWNER and OWNER_SRC (no subshell on the fast paths: the hook is hot).
+resolve_owner() {
   if [ -n "${LEASE_PID-}" ]; then
     is_uint "$LEASE_PID" || die "LEASE_PID must be a number"
-    printf '%s\tLEASE_PID\n' "$LEASE_PID"; return
+    OWNER=$LEASE_PID OWNER_SRC=LEASE_PID; return
   fi
   if [ -n "${CLAUDE_PID-}" ] && is_uint "$CLAUDE_PID" && kill -0 "$CLAUDE_PID" 2>/dev/null; then
-    printf '%s\tCLAUDE_PID\n' "$CLAUDE_PID"; return
+    OWNER=$CLAUDE_PID OWNER_SRC=CLAUDE_PID; return
   fi
   local found
   found=$(ps -A -o pid=,ppid=,comm= 2>/dev/null | awk -v start="$$" -v names="$AGENT_PROCS" '
@@ -89,20 +89,19 @@ owner_pid() {
         p = ppid[p]
       }
     }')
-  if [ -n "$found" ]; then printf '%s\tancestor\n' "$found"; return; fi
-  printf '%s\tPPID\n' "$PPID"
+  if [ -n "$found" ]; then OWNER=$found OWNER_SRC=ancestor; return; fi
+  OWNER=$PPID OWNER_SRC=PPID
 }
 
-# Holder identity: stable per agent session.
-# Prints "holder<TAB>source".
-holder_id() {
-  if [ -n "${LEASE_HOLDER-}" ]; then printf '%s\tLEASE_HOLDER\n' "$LEASE_HOLDER"
-  elif [ -n "${ORCA_PANE_KEY-}" ]; then printf 'orca:%s\tORCA_PANE_KEY\n' "$ORCA_PANE_KEY"
-  elif [ -n "${ORCA_TERMINAL_HANDLE-}" ]; then printf 'orca:%s\tORCA_TERMINAL_HANDLE\n' "$ORCA_TERMINAL_HANDLE"
-  elif [ -n "${CLAUDE_CODE_SESSION_ID-}" ]; then printf 'claude:%s\tCLAUDE_CODE_SESSION_ID\n' "$CLAUDE_CODE_SESSION_ID"
+# Holder identity: stable per agent session. Sets HOLDER and HOLDER_SRC.
+resolve_holder() {
+  if [ -n "${LEASE_HOLDER-}" ]; then HOLDER=$LEASE_HOLDER HOLDER_SRC=LEASE_HOLDER
+  elif [ -n "${ORCA_PANE_KEY-}" ]; then HOLDER="orca:$ORCA_PANE_KEY" HOLDER_SRC=ORCA_PANE_KEY
+  elif [ -n "${ORCA_TERMINAL_HANDLE-}" ]; then HOLDER="orca:$ORCA_TERMINAL_HANDLE" HOLDER_SRC=ORCA_TERMINAL_HANDLE
+  elif [ -n "${CLAUDE_CODE_SESSION_ID-}" ]; then HOLDER="claude:$CLAUDE_CODE_SESSION_ID" HOLDER_SRC=CLAUDE_CODE_SESSION_ID
   else
-    local p; p=$(owner_pid | cut -f1)
-    printf 'pid:%s:%s:%s\tpid+cwd\n' "$(hostname -s 2>/dev/null || echo host)" "$p" "$PWD"
+    [ -n "${OWNER-}" ] || resolve_owner
+    HOLDER="pid:$(hostname -s 2>/dev/null || echo host):$OWNER:$PWD" HOLDER_SRC=pid+cwd
   fi
 }
 
@@ -114,16 +113,12 @@ holder_label() {
     dir=${ORCA_WORKTREE_ID#*::}
   fi
   br=$(git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null)
-  if [ -n "$br" ]; then echo "$(basename "$dir")@$br"; else basename "$dir"; fi
+  if [ -n "$br" ]; then echo "${dir##*/}@$br"; else echo "${dir##*/}"; fi
 }
 
 init_ctx() {
-  IFS=$'\t' read -r HOLDER HOLDER_SRC <<EOF
-$(holder_id)
-EOF
-  IFS=$'\t' read -r OWNER OWNER_SRC <<EOF
-$(owner_pid)
-EOF
+  resolve_owner
+  resolve_holder
   OWNER_START=''
   [ "$OWNER" != 0 ] && OWNER_START=$(proc_start "$OWNER")
   LABEL=$(holder_label)
@@ -492,16 +487,18 @@ cmd_renew_mine() {
   local hook=0
   [ "${1-}" = --hook ] && hook=1
   [ -s "$DB" ] || exit 0
-  init_ctx
-  local t; t=$(now)
+  # minimal context: no label (git), no process start time (ps), no `date`
+  resolve_owner; resolve_holder
+  local t="CAST(strftime('%s','now') AS INTEGER)"
+  local hq="'${HOLDER//\'/\'\'}'"   # SQL-quoted, without a subshell
   # Leases whose owner PID differs (e.g. a previous agent in the same Orca
   # pane) are deliberately NOT renewed: they die by PID check.
-  local mine="holder = $(sq "$HOLDER") AND (pid IS NULL OR pid = 0 OR pid = $OWNER)"
+  local mine="holder = $hq AND (pid IS NULL OR pid = 0 OR pid = $OWNER)"
   local out
   out=$(sql <<SQL 2>/dev/null
 BEGIN IMMEDIATE;
 UPDATE leases SET renewed_at = $t, expires_at = $t + ttl WHERE $mine;
-DELETE FROM lost WHERE holder = $(sq "$HOLDER") AND (pid IS NULL OR pid = 0 OR pid = $OWNER)
+DELETE FROM lost WHERE holder = $hq AND (pid IS NULL OR pid = 0 OR pid = $OWNER)
   RETURNING resource || ' slot ' || IFNULL(slot, '?') || ': ' || detail
             || ' at ' || strftime('%H:%M:%S', ts, 'unixepoch', 'localtime');
 COMMIT;
