@@ -245,9 +245,11 @@ usage:
                                          poll until acquired; exit 4 on timeout
   lease renew <res> [<token>] [--ttl D]  exit 3 (LOST) if it is not yours anymore
   lease release <res> [<token>]          exit 3 if it was not yours anymore
-  lease hold <res> [<token>] [--pid P] [--interval D] [-- cmd args...]
+  lease hold <res> [<token>] [--pid P] [--interval D] [--max 4h] [-- cmd args...]
                                          keep renewing while P (default: caller)
-                                         or cmd lives; exit 3 on LOST
+                                         or cmd lives, for at most --max (0 = no
+                                         limit); exit 3 on LOST. `release` stops
+                                         it (and cmd) with exit 0
   lease renew-mine [--hook]              renew all leases of this holder (hook)
   lease token <res>                      print "<token> <slot>" if you hold it
   lease meta <res> [<token>] --set JSON  merge JSON into your lease's meta
@@ -263,7 +265,7 @@ usage:
 
 exit codes: 0 ok · 1 error · 2 busy · 3 LOST · 4 timeout · 5 not found
 env: LEASE_DB LEASE_HOLDER LEASE_PID LEASE_LABEL LEASE_TTL LEASE_AGENT_PROCS
-     LEASE_NOTIFY (0 = no Orca message to the holder of a lease taken from it)
+     LEASE_HOLD_MAX (4h) LEASE_NOTIFY (0 = no Orca message to the holder of a lease taken from it)
 EOF
 }
 
@@ -532,6 +534,7 @@ cmd_release() {
   local tok=${1-}
   ensure_db; init_ctx
   [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
+  stop_holds "$res" "$tok"
   local t out; t=$(now)
   out=$(sql <<SQL
 BEGIN IMMEDIATE;
@@ -595,17 +598,19 @@ SQL
 
 cmd_hold() {
   local res=${1-}; valid_res "$res"; shift
-  local tok='' pid=$PPID interval='' cmd=()
+  local tok='' pid=$PPID interval='' max=${LEASE_HOLD_MAX:-4h} cmd=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --pid) pid=${2-}; shift 2;;
       --interval) interval=$(parse_dur "${2-}") || exit 1; shift 2;;
+      --max) max=${2-}; shift 2;;
       --) shift; cmd=("$@"); break;;
       -*) die "unknown option $1";;
       *) [ -z "$tok" ] || die "unexpected argument: $1"; tok=$1; shift;;
     esac
   done
   is_uint "$pid" || die "--pid must be a number"
+  max=$(parse_dur "$max") || exit 1
   ensure_db; init_ctx
   [ -n "$tok" ] || tok=$(my_token "$res") || exit $?
   local ttl
@@ -616,7 +621,10 @@ cmd_hold() {
   if [ -z "$interval" ]; then interval=$(( ttl / 3 )); [ "$interval" -le 60 ] || interval=60; fi
   [ "$interval" -ge 1 ] || interval=1
 
-  local child='' what
+  # `lease release` by the same holder (e.g. lease-supabase down) sends USR1:
+  # stop the command and exit 0 — that is not a LOST.
+  local child='' what released=0
+  trap 'released=1' USR1
   if [ ${#cmd[@]} -gt 0 ]; then
     "${cmd[@]}" & child=$!
     pid=$child
@@ -625,27 +633,65 @@ cmd_hold() {
   else
     what=$(ps -o command= -p "$pid" 2>/dev/null)
   fi
-  # record what keeps the lease alive (shown by BUSY and `lease ls`)
+  # record what keeps the lease alive (shown by BUSY, ls and top), keyed by
+  # this hold's own pid so `release` can stop it
   [ ${#what} -le 60 ] || what="${what:0:57}..."
-  hold_meta() { "$0" meta "$res" "$tok" --set "$(sql <<<"SELECT json_object('holds', json_object('$pid', $1));")" >/dev/null 2>&1; }
+  hold_meta() { "$0" meta "$res" "$tok" --set "$(sql <<<"SELECT json_object('holds', json_object('$$', $1));")" >/dev/null 2>&1; }
   hold_meta "$(sq "$what")"
-  local rc=0
-  while kill -0 "$pid" 2>/dev/null; do
-    "$0" renew "$res" "$tok" -q 2>/dev/null; rc=$?
-    if [ "$rc" != 0 ]; then
-      if [ "$rc" = "$EX_LOST" ]; then
-        echo "LOST $res while holding it — stopping${child:+ $what}" >&2
-        [ -n "$child" ] && kill_tree "$child"
-        exit "$EX_LOST"
-      fi
+  local rc=0 t0 renewing=1
+  t0=$(now)
+  while kill -0 "$pid" 2>/dev/null && [ "$released" = 0 ]; do
+    # --max: past it, stop renewing. The lease then behaves like an idle
+    # agent's: kept until someone else needs the slot (then LOST below).
+    if [ "$renewing" = 1 ] && [ "$max" -gt 0 ] && [ $(( $(now) - t0 )) -ge "$max" ]; then
+      renewing=0
+      echo "lease hold: $res held for $(fmt_dur "$max") (--max): no longer renewing; the slot is kept until someone else needs it" >&2
+      hold_meta "$(sq "$what [max $(fmt_dur "$max") reached]")"
     fi
-    # sleep in 1s steps so we notice the process ending promptly
+    if [ "$renewing" = 1 ]; then
+      "$0" renew "$res" "$tok" -q 2>/dev/null; rc=$?
+    elif [ -n "$(sql <<<"SELECT 1 FROM leases WHERE resource=$(sq "$res") AND token=$(sq "$tok");" 2>/dev/null)" ]; then
+      rc=0
+    else
+      rc=$EX_LOST
+    fi
+    [ "$released" = 1 ] && break
+    if [ "$rc" = "$EX_LOST" ]; then
+      echo "LOST $res while holding it — stopping${child:+ $what}" >&2
+      [ -n "$child" ] && kill_tree "$child"
+      exit "$EX_LOST"
+    fi
+    # sleep in 1s steps so we notice the process ending (or USR1) promptly
     local i=0
-    while [ "$i" -lt "$interval" ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    while [ "$i" -lt "$interval" ] && [ "$released" = 0 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
   done
+  if [ "$released" = 1 ]; then
+    echo "lease hold: $res released by its holder${child:+ — stopped $what}" >&2
+    [ -n "$child" ] && { kill_tree "$child"; wait "$child" 2>/dev/null; }
+    exit 0
+  fi
   hold_meta NULL
   if [ -n "$child" ]; then wait "$child"; exit $?; fi
   exit 0
+}
+
+# stop_holds <res> <token>: tell the `lease hold` processes of a lease that it
+# is being released (USR1), and wait a little for them to stop their commands.
+stop_holds() {
+  local p c pids='' n=0
+  for p in $(sql <<<"SELECT key FROM leases, json_each(json_extract(meta, '\$.holds'))
+                     WHERE resource = $(sq "$1") AND token = $(sq "$2");" 2>/dev/null); do
+    is_uint "$p" || continue
+    c=$(ps -o command= -p "$p" 2>/dev/null)
+    case "$c" in *lease*" hold "*) kill -USR1 "$p" 2>/dev/null && pids="$pids $p";; esac   # pid reuse guard
+  done
+  [ -n "$pids" ] || return 0
+  while [ "$n" -lt 10 ]; do
+    c=0; for p in $pids; do kill -0 "$p" 2>/dev/null && c=1; done
+    [ "$c" = 0 ] && return 0
+    sleep 0.5; n=$((n+1))
+  done
+  warn "some holds of $1 did not stop within 5s:$pids"
 }
 
 # kill_tree <pid>: TERM a process and its descendants (a dev server started by

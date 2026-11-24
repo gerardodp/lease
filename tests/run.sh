@@ -303,6 +303,46 @@ STUB
   unset LEASE_ORCA_BIN
 }
 
+test_release_stops_holds() {
+  as A acquire db >/dev/null
+  local mark="$TMP/rel-$$"
+  LEASE_HOLDER=A LEASE_PID=0 "$LEASE" hold db --interval 30s -- sh -c "sleep 40; touch $mark" & local h=$!
+  sleep 1
+  local hp; hp=$(q "SELECT key FROM leases, json_each(json_extract(meta,'\$.holds'))")
+  eq "$hp" "$h" "holds keyed by the hold's own pid"
+  local t0; t0=$(date +%s)
+  as A release db >/dev/null; eq $? 0 "release rc"
+  wait $h; eq $? 0 "hold exits 0 when its own holder releases"
+  [ $(( $(date +%s) - t0 )) -le 3 ] || bad "release must stop the hold right away (not at the next renew)"
+  pgrep -f "sleep 40; touch $mark" >/dev/null && bad "command survived the release"
+  # a stale pid in holds that is not a lease hold is never signalled
+  as A acquire db >/dev/null
+  sleep 60 & local other=$!
+  as A meta db --set "{\"holds\":{\"$other\":\"x\"}}" >/dev/null
+  as A release db >/dev/null
+  kill -0 $other 2>/dev/null || bad "signalled a process that is not a lease hold"
+  kill $other 2>/dev/null; true
+}
+
+test_hold_max() {
+  as A acquire db --ttl 2s >/dev/null
+  LEASE_HOLDER=A LEASE_PID=0 "$LEASE" hold db --interval 1s --max 3s -- sleep 30 2>"$TMP/max.err" & local h=$!
+  sleep 2.5
+  eq "$(rc as B acquire db)" 2 "renewed within --max"
+  sleep 4
+  has "$(cat "$TMP/max.err")" "no longer renewing"
+  has "$(q "SELECT meta FROM leases")" "max 3s reached"
+  eq "$(q "SELECT holder FROM leases")" A "expired but kept: nobody needed it"
+  kill -0 $h 2>/dev/null || bad "hold must keep running after --max"
+  as B acquire db >/dev/null; eq $? 0 "taken on contention"
+  wait $h; eq $? 3 "then the hold stops its command: LOST"
+  # --max 0: no limit
+  as B release db >/dev/null; as A acquire db --ttl 2s >/dev/null
+  LEASE_HOLDER=A LEASE_PID=0 "$LEASE" hold db --interval 1s --max 0 -- sleep 5 & h=$!
+  sleep 4; eq "$(rc as B acquire db)" 2 "--max 0 renews without limit"
+  wait $h
+}
+
 test_renew_mine() {
   sleep 300 & local me=$!
   sleep 300 & local other=$!
@@ -687,6 +727,22 @@ test_sb_aliases() {
   grep -q 'supabase migration up .*url= *$' "$FAKE/calls" || { bad "the supabase CLI must not get app aliases"; cat "$FAKE/calls"; }
 }
 
+test_sb_test_db_network() {
+  sb_setup testdb
+  sbx up >/dev/null 2>&1; : > "$FAKE/calls"
+  sbx exec -- supabase test db >/dev/null
+  grep -q 'supabase test db --network-id lease-supabase |' "$FAKE/calls" || { bad "test db gets the shared network"; cat "$FAKE/calls"; }
+  : > "$FAKE/calls"; sbx exec -- supabase test db --network-id mine >/dev/null
+  grep -q 'network-id lease-supabase' "$FAKE/calls" && bad "explicit --network-id wins"
+  : > "$FAKE/calls"; sbx exec -- supabase test db --db-url postgres://x >/dev/null
+  grep -q 'network-id' "$FAKE/calls" && bad "not for --db-url"
+  : > "$FAKE/calls"; sbx exec -- supabase gen types --local >/dev/null
+  grep -q 'network-id' "$FAKE/calls" && bad "only test db"
+  : > "$FAKE/calls"; LEASE_SUPABASE_NETWORK= sbx exec -- supabase test db >/dev/null
+  grep -q 'network-id' "$FAKE/calls" && bad "no shared network, no flag"
+  true
+}
+
 test_sb_exec_holds() {
   sb_setup hold
   sbx up --ttl 2s >/dev/null 2>&1
@@ -699,9 +755,10 @@ test_sb_exec_holds() {
   # down stops what runs through exec
   sbx exec -- sleep 30 & e=$!
   sleep 1.5; sbx down >/dev/null
-  wait $e; eq $? 3 "exec'd command stopped (exit 3) when the slot is released"
+  wait $e; eq $? 0 "exec'd command stopped (exit 0, not LOST) when its own holder releases"
   # --no-hold: plain exec
   sbx up >/dev/null 2>&1
+  eq "$(sbx exec --hold -- sh -c 'echo ok')" ok "--hold accepted"
   eq "$(sbx exec --no-hold -- sh -c 'echo $SUPABASE_PROJECT_ID')" toy_lease0 "--no-hold"
 }
 

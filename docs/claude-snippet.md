@@ -30,6 +30,8 @@ SQLite at ~/.local/state/lease). Rules:
   way silently ends up talking to another project's database once your lease
   expires and someone else takes the slot. Each stack has its own JWT secret, so a
   stale app gets 401s: if you see unexpected 401s, check `lease-supabase status`.
+  `exec` keeps renewing for at most 4h (`lease hold --max`); after that the slot is
+  kept only while nobody else needs it.
 - **When done** with Supabase: `lease-supabase down` (keeps the stack running for a
   warm restart; `--stop` to free RAM). It also stops what you launched with `exec`.
   Don't sit on a slot while doing unrelated work.

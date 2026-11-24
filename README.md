@@ -181,7 +181,9 @@ lease top [--interval 2s] [--once] [-n N] [--no-banner]
 - `token` es opcional en `renew`/`release`/`hold`/`meta`: si no lo pasas se usa el lease del holder actual. Cada Bash tool call es un shell nuevo, así que los agentes no tienen que guardarlo. Si lo pasas, se valida (fencing).
 - Re-adquirir siendo el mismo holder es idempotente: devuelve el mismo token y slot y renueva.
 - Duraciones: `90s`, `15m`, `2h`, `1d` o segundos a secas.
-- `hold … -- cmd` renueva mientras corre `cmd` (cada `ttl/3`, como mucho cada minuto), devuelve su exit code y, si el lease se pierde, mata `cmd` con sus descendientes y sale con 3. Sin `-- cmd`, renueva mientras viva `--pid` (por defecto el proceso que lo llama). No libera el lease al terminar. Mientras dura, anota el comando en el meta del lease (`holds`), que BUSY y `lease ls` enseñan.
+- `hold … -- cmd` renueva mientras corre `cmd` (cada `ttl/3`, como mucho cada minuto), devuelve su exit code y, si el lease se pierde, mata `cmd` con sus descendientes y sale con 3. Sin `-- cmd`, renueva mientras viva `--pid` (por defecto el proceso que lo llama). No libera el lease al terminar. Mientras dura, anota el comando en el meta del lease (`holds`, con el PID del propio hold), que BUSY, `lease ls` y `lease top` enseñan.
+  - **`release` para sus holds.** `lease release` (y `lease-supabase down`) manda USR1 a los `lease hold` de ese lease (comprobando que el PID sigue siendo un `lease hold`) y espera hasta 5 s: el hold para `cmd` y sale con **0**. El 3 queda para cuando te lo quita otro.
+  - **`--max` (por defecto 4h, `LEASE_HOLD_MAX`; `0` = sin límite).** Pasado ese tiempo el hold deja de renovar pero no mata nada: el lease se comporta como el de un agente inactivo y solo se pierde si otro necesita el slot. Entonces el hold para `cmd` (exit 3) y el holder recibe el aviso de Orca. Si el agente sigue trabajando, el hook lo renueva en cada tool call. Así un `pnpm dev` olvidado no bloquea a nadie durante días.
 - **BUSY** dice cuántos slots hay ocupados (`1/1`), quién tiene cada uno y qué comando lo retiene, y sugiere `lease wait` (o `lease-supabase up --wait`). La capacidad la decide el usuario; el mensaje pide a los agentes que no la toquen.
 - **Aviso activo al perder un lease.** Cuando alguien se queda un lease caducado cuyo agente sigue vivo, `lease` manda en segundo plano un mensaje de Orca (`orca orchestration send`) al terminal del holder anterior (holder `orca:<tab>:<pane>`). Orca lo inyecta en la sesión de ese agente, sin esperar a su siguiente tool call. Es best effort: sin Orca no hace nada. `LEASE_NOTIFY=0` lo desactiva.
 
@@ -310,7 +312,7 @@ lease-supabase up [--wait] [--timeout 30m] [--ttl 15m] [--reset | --no-reset] [-
 lease-supabase down [--stop | --purge]
 lease-supabase status
 lease-supabase env [--dotenv | --json]
-lease-supabase exec [--no-hold] -- <cmd…>   # `supabase` a secas = CLI del proyecto
+lease-supabase exec [--hold|--no-hold] -- <cmd…>   # `supabase` a secas = CLI del proyecto; --hold es el defecto
 lease-supabase ports [<slot>]
 ```
 
@@ -369,7 +371,13 @@ chocan. `LEASE_SUPABASE_NETWORK=` vuelve al comportamiento normal.
 
 `down` libera y deja el stack corriendo (el siguiente `up` del mismo worktree es
 instantáneo). `--stop` lo para conservando volúmenes y `--purge` además borra
-los volúmenes. Lo que se lanzó con `exec` se para al soltar el slot.
+los volúmenes. Lo que se lanzó con `exec` se para al soltar el slot (exit 0).
+
+**`supabase test db`** no hace caso a `SUPABASE_NETWORK_ID` (CLI 2.120): busca la
+red `supabase_network_<project_id>`, que no existe porque los slots comparten la
+red `lease-supabase`, y falla con `network … not found`. `exec` le añade
+`--network-id lease-supabase` (salvo que ya lo traiga, o use `--db-url`/`--linked`).
+Solo a `test db`: otros comandos rechazan `--network-id` (p. ej. `gen types`).
 
 ### JWT secret por proyecto
 
@@ -426,7 +434,7 @@ de usuario y las claves JWT (`ANON_KEY`, `SERVICE_ROLE_KEY`) de un proyecto dan
 - Un lease caducado pero no reclamado por nadie se **revive** en el siguiente renew de su dueño. Es a propósito: nadie lo tenía.
 - El hook solo renueva por actividad del agente. Un agente más de 15 min sin tool calls puede perder el lease, pero solo si en ese rato otro necesita el slot.
 - Un agente colgado pero vivo retiene su slot hasta que alguien lo necesite.
-- Un `hold` (o `lease-supabase exec`) retiene el slot mientras viva su comando: un `pnpm dev` olvidado lo bloquea indefinidamente (con capacidad 1, a todos). BUSY y `lease ls` muestran qué comando es, para poder pararlo.
+- Un `hold` (o `lease-supabase exec`) renueva el slot mientras viva su comando, hasta `--max` (4h por defecto). Después lo conserva solo mientras nadie más lo necesite. BUSY, `lease ls` y `lease top` muestran qué comando es.
 - `capacity` menor que los slots ocupados no expulsa a nadie: esos slots se marcan `held*` hasta que se liberen.
 - El holder fallback (`pid:host:pid:cwd`) cambia con cada shell. Fuera de Claude/Orca, fija `LEASE_HOLDER`.
 

@@ -196,7 +196,7 @@ usage:
                                         --purge also deletes its volumes)
   lease-supabase status                 slots, who holds them, what runs where
   lease-supabase env [--dotenv|--json]  env for the slot you hold (overrides + URLs/keys)
-  lease-supabase exec [--no-hold] -- <cmd...>
+  lease-supabase exec [--hold|--no-hold] -- <cmd...>
                                         run cmd with the slot env (e.g. supabase db reset,
                                         pnpm test, pnpm dev). A bare `supabase` uses the
                                         project's CLI. Renews the slot while cmd runs and
@@ -432,6 +432,7 @@ cmd_exec() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-hold) hold=0; shift;;
+      --hold) hold=1; shift;;   # the default; accepted because it is what people type
       --) shift; break;;
       *) break;;
     esac
@@ -443,9 +444,27 @@ cmd_exec() {
   load_project
   local envs=() l
   while IFS= read -r l; do [ -n "$l" ] && envs+=("$l"); done <<<"$lines"
-  if [ "$1" = supabase ]; then shift; set -- "$SB" "$@"; fi
+  if [ "$1" = supabase ]; then
+    shift
+    # `supabase test db` ignores SUPABASE_NETWORK_ID (CLI 2.120) and looks for
+    # supabase_network_<project_id>, which does not exist when the slots share
+    # a network: give it the network explicitly. Only there: other commands
+    # reject --network-id (e.g. gen types).
+    [ -n "$NETWORK" ] && is_local_test_db "$@" && set -- "$@" --network-id "$NETWORK"
+    set -- "$SB" "$@"
+  fi
   [ "$hold" = 1 ] && set -- "$LEASE" hold "$RES" -- "$@"
   exec env "${envs[@]}" "$@"
+}
+
+is_local_test_db() { # <supabase args...>
+  local a prev='' found=0
+  for a in "$@"; do
+    case "$a" in --network-id|--network-id=*|--db-url|--db-url=*|--linked) return 1;; esac
+    [ "$prev" = test ] && [ "$a" = db ] && found=1
+    prev=$a
+  done
+  [ "$found" = 1 ]
 }
 
 cmd_ports() {
