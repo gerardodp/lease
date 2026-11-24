@@ -263,6 +263,7 @@ usage:
 
 exit codes: 0 ok · 1 error · 2 busy · 3 LOST · 4 timeout · 5 not found
 env: LEASE_DB LEASE_HOLDER LEASE_PID LEASE_LABEL LEASE_TTL LEASE_AGENT_PROCS
+     LEASE_NOTIFY (0 = no Orca message to the holder of a lease taken from it)
 EOF
 }
 
@@ -350,21 +351,67 @@ SELECT CASE WHEN st.mine THEN 'renewed' ELSE 'ok' END, token, slot, expires_at
   FROM leases CROSS JOIN st WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER");
 SELECT 'busy', '', '', '' WHERE NOT EXISTS (
   SELECT 1 FROM leases WHERE resource = $(sq "$res") AND holder = $(sq "$HOLDER"));
+SELECT 'reaped', holder, slot, why FROM reaped;
 COMMIT;
 SQL
 ) || die "database error during acquire"
   IFS=$'\t' read -r ACQ_STATUS ACQ_TOKEN ACQ_SLOT ACQ_EXPIRES <<EOF
 $out
 EOF
-  ACQ_BUSY=''
+  local reaped; reaped=$(printf '%s\n' "$out" | awk -F'\t' '$1=="reaped"{print $2 "\t" $3 "\t" $4}')
+  [ -n "$reaped" ] && notify_reaped "$res" "$reaped"
+  ACQ_BUSY='' ACQ_CAP=''
   if [ "$ACQ_STATUS" = busy ]; then
+    ACQ_CAP=$(sql <<SQL
+SELECT (SELECT COUNT(*) FROM leases WHERE resource = $(sq "$res")
+          AND slot < (SELECT capacity FROM resources WHERE name = $(sq "$res")))
+       || '/' || capacity FROM resources WHERE name = $(sq "$res");
+SQL
+)
     ACQ_BUSY=$(sql <<SQL
 SELECT 'slot ' || slot || ': ' || IFNULL(label, holder) || ' (' || holder || '), '
        || CASE WHEN expires_at >= $t THEN (expires_at - $t) || 's left' ELSE 'expired' END
+       || IFNULL(' · running: ' || (SELECT group_concat(j.value || ' (pid ' || j.key || ')', ', ')
+                                     FROM json_each(json_extract(meta, '\$.holds')) j), '')
   FROM leases WHERE resource = $(sq "$res") ORDER BY slot;
 SQL
 )
   fi
+}
+
+# busy_report <res>: the explanation BUSY prints to stderr.
+busy_report() {
+  printf '%s\n' "$ACQ_BUSY" | sed 's/^/  /'
+  echo "  queue up instead of retrying: lease wait $1   (lease-supabase up --wait)"
+  echo "  capacity ($ACQ_CAP) is the user's decision; do not raise it yourself (lease capacity $1 N)"
+}
+
+# Tell the previous holders of reaped leases (expired while their agent is
+# alive) right away instead of on their next tool call. Best effort, in the
+# background: an Orca message to the holder's terminal (holder orca:<tab>:<pane>).
+# LEASE_NOTIFY=0 disables it; LEASE_ORCA_BIN overrides the Orca CLI path.
+notify_reaped() { # <res> <lines "holder\tslot\twhy">
+  [ "${LEASE_NOTIFY:-1}" = 0 ] && return 0
+  local orca=${LEASE_ORCA_BIN:-/Applications/Orca.app/Contents/Resources/bin/orca}
+  [ -x "$orca" ] || return 0
+  local res=$1 lines=$2 by=$LABEL
+  (
+    trap '' HUP
+    terms=$(perl -e 'alarm shift; exec @ARGV' 10 "$orca" terminal list --json 2>/dev/null) || exit 0
+    printf '%s\n' "$lines" | while IFS=$'\t' read -r holder slot why; do
+      # a dead agent (why=pid) cannot read it
+      [ "$why" = ttl ] || continue
+      case "$holder" in orca:*:*) ;; *) continue;; esac
+      pane=${holder#orca:}
+      handle=$(sqlite3 :memory: "SELECT json_extract(value,'\$.handle') FROM json_each(json_extract($(sq "$terms"),'\$.result.terminals'))
+        WHERE json_extract(value,'\$.tabId') || ':' || json_extract(value,'\$.leafId') = $(sq "$pane") LIMIT 1;" 2>/dev/null)
+      [ -n "$handle" ] || continue
+      perl -e 'alarm shift; exec @ARGV' 10 "$orca" orchestration send --to "$handle" --type status \
+        --subject "lease: you LOST $res slot $slot" \
+        --body "Your lease on $res slot $slot expired (not renewed for longer than its TTL) and was taken by $by. Anything you were running against it may now be talking to someone else's stack: stop using it, and acquire it again before touching it (lease-supabase up for Supabase)." \
+        >/dev/null 2>&1
+    done
+  ) </dev/null >/dev/null 2>&1 &
 }
 
 print_acquired() { # res json?
@@ -402,8 +449,8 @@ cmd_acquire() {
   ensure_db; init_ctx; valid_json "$OPT_META"
   do_acquire "$res" "$OPT_TTL" "$OPT_META"
   if [ "$ACQ_STATUS" = busy ]; then
-    echo "BUSY $res" >&2
-    printf '%s\n' "$ACQ_BUSY" | sed 's/^/  /' >&2
+    echo "BUSY $res: $ACQ_CAP slots held" >&2
+    busy_report "$res" >&2
     exit "$EX_BUSY"
   fi
   print_acquired "$res" "$OPT_JSON"
@@ -428,7 +475,7 @@ cmd_wait() {
     do_acquire "$res" "$OPT_TTL" "$OPT_META"
     if [ "$ACQ_STATUS" != busy ]; then print_acquired "$res" "$OPT_JSON"; return 0; fi
     if [ "$said" = 0 ]; then
-      echo "waiting for $res (timeout $(fmt_dur "$timeout")):" >&2
+      echo "waiting for $res (timeout $(fmt_dur "$timeout"); $ACQ_CAP slots held):" >&2
       printf '%s\n' "$ACQ_BUSY" | sed 's/^/  /' >&2; said=1
     fi
     [ "$(now)" -ge "$deadline" ] && { echo "TIMEOUT waiting for $res" >&2; exit "$EX_TIMEOUT"; }
@@ -564,21 +611,31 @@ cmd_hold() {
   local ttl
   ttl=$(sql <<<"SELECT ttl FROM leases WHERE resource=$(sq "$res") AND token=$(sq "$tok");")
   [ -n "$ttl" ] || { echo "LOST $res: token is no longer valid" >&2; exit "$EX_LOST"; }
-  [ -n "$interval" ] || interval=$(( ttl / 3 )); [ "$interval" -ge 1 ] || interval=1
+  # renew at most every minute: a lost lease is noticed (and its command
+  # stopped) within that time
+  if [ -z "$interval" ]; then interval=$(( ttl / 3 )); [ "$interval" -le 60 ] || interval=60; fi
+  [ "$interval" -ge 1 ] || interval=1
 
-  local child=''
+  local child='' what
   if [ ${#cmd[@]} -gt 0 ]; then
     "${cmd[@]}" & child=$!
     pid=$child
-    trap '[ -n "$child" ] && kill "$child" 2>/dev/null' INT TERM
+    what="${cmd[*]}"
+    trap '[ -n "$child" ] && kill_tree "$child"' INT TERM
+  else
+    what=$(ps -o command= -p "$pid" 2>/dev/null)
   fi
+  # record what keeps the lease alive (shown by BUSY and `lease ls`)
+  [ ${#what} -le 60 ] || what="${what:0:57}..."
+  hold_meta() { "$0" meta "$res" "$tok" --set "$(sql <<<"SELECT json_object('holds', json_object('$pid', $1));")" >/dev/null 2>&1; }
+  hold_meta "$(sq "$what")"
   local rc=0
   while kill -0 "$pid" 2>/dev/null; do
     "$0" renew "$res" "$tok" -q 2>/dev/null; rc=$?
     if [ "$rc" != 0 ]; then
       if [ "$rc" = "$EX_LOST" ]; then
-        echo "LOST $res while holding it — stopping" >&2
-        [ -n "$child" ] && kill "$child" 2>/dev/null
+        echo "LOST $res while holding it — stopping${child:+ $what}" >&2
+        [ -n "$child" ] && kill_tree "$child"
         exit "$EX_LOST"
       fi
     fi
@@ -586,8 +643,17 @@ cmd_hold() {
     local i=0
     while [ "$i" -lt "$interval" ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
   done
+  hold_meta NULL
   if [ -n "$child" ]; then wait "$child"; exit $?; fi
   exit 0
+}
+
+# kill_tree <pid>: TERM a process and its descendants (a dev server started by
+# pnpm/npm runs in grandchildren that a plain kill would orphan).
+kill_tree() {
+  local p
+  for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
+  kill "$1" 2>/dev/null
 }
 
 # Shared, persistent configuration of a resource (JSON), e.g. lease-supabase's
@@ -871,6 +937,11 @@ top_frame() { # <log lines> <width>: prints one frame
           fi
         fi
         [ "$slot" -ge "$cap" ] && note="over capacity${note:+; $note}"
+        if [ -n "$meta" ]; then   # what keeps it alive (lease hold / lease-supabase exec)
+          local running
+          running=$(sqlite3 :memory: "SELECT group_concat(value, ', ') FROM json_each(json_extract($(sq "$meta"), '\$.holds'));" 2>/dev/null)
+          [ -n "$running" ] && note="running: $running${note:+; $note}"
+        fi
         printf '%s%-14s %4s  %-8s %-30s %-8s %-8s %s%s\n' "$col" "${name:0:14}" "$slot" "$state" "${who:0:30}" "$since" "$l" "$note" "$R"
       done <<EOF
 $rows

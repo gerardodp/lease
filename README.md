@@ -39,11 +39,24 @@ repo.
 lease-supabase up                          # coge un slot y arranca (o reutiliza) su stack
 lease-supabase exec -- supabase db reset   # comandos con el entorno del slot
 lease-supabase exec -- pnpm test:integration
+lease-supabase exec -- pnpm dev            # servidor de desarrollo: retiene el slot mientras vive
 lease-supabase down                        # devuelve el slot (el stack sigue encendido)
 ```
 
 Usa siempre `exec` (o `eval "$(lease-supabase env)"`): un `supabase …` a secas
 apunta al stack por defecto del proyecto, no al del slot.
+
+**Servidores de desarrollo, siempre con `exec`.** `exec` corre el comando bajo
+`lease hold`: renueva el slot mientras el proceso vive (aunque el agente esté
+parado) y, si el slot se pierde (`down`, o el agente murió y otro lo cogió),
+para el proceso con su árbol de hijos. Un `pnpm dev` lanzado por fuera sigue
+funcionando cuando otro proyecto se queda el slot, contra la base de datos de
+ese otro proyecto y sin ningún error. Para eso existe también la segunda red de
+seguridad: cada stack tiene **su propio JWT secret** (ver más abajo), así que esa
+app empieza a recibir 401.
+
+`exec` también exporta los nombres que leen las apps (`SUPABASE_URL`,
+`NEXT_PUBLIC_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`…), que ganan a los `.env`.
 
 ### ¿Uno o varios Supabase en paralelo?
 
@@ -168,7 +181,24 @@ lease top [--interval 2s] [--once] [-n N] [--no-banner]
 - `token` es opcional en `renew`/`release`/`hold`/`meta`: si no lo pasas se usa el lease del holder actual. Cada Bash tool call es un shell nuevo, así que los agentes no tienen que guardarlo. Si lo pasas, se valida (fencing).
 - Re-adquirir siendo el mismo holder es idempotente: devuelve el mismo token y slot y renueva.
 - Duraciones: `90s`, `15m`, `2h`, `1d` o segundos a secas.
-- `hold … -- cmd` renueva mientras corre `cmd`, devuelve su exit code y, si el lease se pierde, mata `cmd` y sale con 3. Sin `-- cmd`, renueva mientras viva `--pid` (por defecto el proceso que lo llama). No libera el lease al terminar.
+- `hold … -- cmd` renueva mientras corre `cmd` (cada `ttl/3`, como mucho cada minuto), devuelve su exit code y, si el lease se pierde, mata `cmd` con sus descendientes y sale con 3. Sin `-- cmd`, renueva mientras viva `--pid` (por defecto el proceso que lo llama). No libera el lease al terminar. Mientras dura, anota el comando en el meta del lease (`holds`), que BUSY y `lease ls` enseñan.
+- **BUSY** dice cuántos slots hay ocupados (`1/1`), quién tiene cada uno y qué comando lo retiene, y sugiere `lease wait` (o `lease-supabase up --wait`). La capacidad la decide el usuario; el mensaje pide a los agentes que no la toquen.
+- **Aviso activo al perder un lease.** Cuando alguien se queda un lease caducado cuyo agente sigue vivo, `lease` manda en segundo plano un mensaje de Orca (`orca orchestration send`) al terminal del holder anterior (holder `orca:<tab>:<pane>`). Orca lo inyecta en la sesión de ese agente, sin esperar a su siguiente tool call. Es best effort: sin Orca no hace nada. `LEASE_NOTIFY=0` lo desactiva.
+
+#### Puertos de la app (3000, Redis…)
+
+`lease` vale para cualquier recurso contable. Para puertos que chocan entre
+worktrees:
+
+```sh
+lease capacity app-port 4          # una vez (lo decide el usuario)
+read -r _ k < <(lease acquire app-port)
+PORT=$((3000 + k)) lease-supabase exec -- pnpm dev   # o lease hold app-port -- …
+```
+
+Para servicios auxiliares con puerto fijo (p. ej. srh/Redis en 8079), lo mismo
+con su propio recurso (`lease acquire redis-port`) y `8079 + k`, si el
+compose/arranque acepta el puerto por variable.
 
 ### `lease top`
 
@@ -198,16 +228,18 @@ mostrarla.
 
 `LEASE_DB` (default `~/.local/state/lease/lease.db`), `LEASE_HOLDER`, `LEASE_PID`
 (`0` = solo TTL), `LEASE_LABEL`, `LEASE_TTL` (default `15m`),
-`LEASE_AGENT_PROCS` (default `claude`), `LEASE_BUSY_TIMEOUT_MS` (15000).
+`LEASE_AGENT_PROCS` (default `claude`), `LEASE_BUSY_TIMEOUT_MS` (15000),
+`LEASE_NOTIFY` (`0` = sin aviso de Orca al quitar un lease), `LEASE_ORCA_BIN`.
 
 ## Protocolo para agentes
 
 Snippet listo para `~/.claude/CLAUDE.md`: [`docs/claude-snippet.md`](docs/claude-snippet.md). En resumen:
 
 1. Antes de Supabase/tests de integración: `lease-supabase up` (o `lease acquire <res>`). Si da 2, `--wait` o avisar.
-2. Comandos contra el stack, siempre con el entorno del slot: `lease-supabase exec -- …`.
+2. Comandos contra el stack, siempre con el entorno del slot: `lease-supabase exec -- …`. Servidores de desarrollo incluidos (`exec` retiene el slot mientras viven).
 3. Al acabar: `lease-supabase down` / `lease release <res>`.
-4. Mensaje del hook "you LOST" o exit 3 → dejar de tocar el recurso y volver a pedirlo.
+4. Mensaje "you LOST" (hook u Orca) o exit 3 → dejar de tocar el recurso y volver a pedirlo.
+6. No cambiar la capacidad: la decide el usuario.
 5. Nunca parar/resetear stacks ajenos. `lease ls` / `lease-supabase status` para ver el estado.
 
 ## Diseño
@@ -278,7 +310,7 @@ lease-supabase up [--wait] [--timeout 30m] [--ttl 15m] [--reset | --no-reset] [-
 lease-supabase down [--stop | --purge]
 lease-supabase status
 lease-supabase env [--dotenv | --json]
-lease-supabase exec -- <cmd…>          # `supabase` a secas = CLI del proyecto
+lease-supabase exec [--no-hold] -- <cmd…>   # `supabase` a secas = CLI del proyecto
 lease-supabase ports [<slot>]
 ```
 
@@ -337,18 +369,49 @@ chocan. `LEASE_SUPABASE_NETWORK=` vuelve al comportamiento normal.
 
 `down` libera y deja el stack corriendo (el siguiente `up` del mismo worktree es
 instantáneo). `--stop` lo para conservando volúmenes y `--purge` además borra
-los volúmenes.
+los volúmenes. Lo que se lanzó con `exec` se para al soltar el slot.
+
+### JWT secret por proyecto
+
+Con el secret de demo del CLI, todos los stacks firman igual: una app que se
+queda apuntando a un slot que ya es de otro repo sigue funcionando contra la BD
+ajena. `lease-supabase` arranca cada stack con
+`SUPABASE_AUTH_JWT_SECRET = sha256("lease-supabase:<project_id>")`: los tokens
+de usuario y las claves JWT (`ANON_KEY`, `SERVICE_ROLE_KEY`) de un proyecto dan
+401 en el stack de otro.
+
+- Es determinista por `project_id` (`<base>_lease<k>`): los reinicios en caliente
+  y los volúmenes guardados siguen valiendo. Dos worktrees del mismo repo
+  comparten `project_id` y, por tanto, secret; ahí no se nota (mismo esquema).
+- Solo se aplica a volúmenes **creados** con él: el meta del slot lo recuerda por
+  project_id. Un stack con volúmenes anteriores sigue con el secret de demo y `up`
+  avisa de cómo cambiar (`down --purge && up`, que borra sus datos).
+- Si el `config.toml` define `auth.jwt_secret` o `auth.signing_keys_path`, se
+  respeta. `LEASE_SUPABASE_PER_PROJECT_JWT=0` lo desactiva.
+- Las claves opacas nuevas (`sb_publishable_…`, `sb_secret_…`) son constantes en
+  el CLI (2.120) y no dependen del secret: una app que solo use esas **no** dará
+  401 con su clave, aunque las sesiones de usuario sí.
+- Las claves salen siempre de `lease-supabase env`/`exec`. Si la app tiene las
+  claves de demo escritas en su `.env`, deja de funcionar: es lo buscado, y se
+  arregla con los alias de abajo.
 
 ### Exponer URLs/keys al proyecto
 
 - `lease-supabase exec -- <cmd>`: entorno del slot (`SUPABASE_*` para el CLI) más la salida de `supabase status -o env` (`API_URL`, `DB_URL`, `ANON_KEY`, `SERVICE_ROLE_KEY`, `STUDIO_URL`…). Es lo recomendado para agentes, porque cada Bash call es un shell nuevo.
 - `eval "$(lease-supabase env)"`: lo mismo en el shell actual. `--dotenv` / `--json` para otros formatos.
-- `LEASE_SUPABASE_OVERRIDE_NAMES=api.url=NEXT_PUBLIC_SUPABASE_URL,auth.anon_key=NEXT_PUBLIC_SUPABASE_ANON_KEY` renombra variables (lo pasa a `supabase status --override-name`).
+- **Alias para apps.** Además de los nombres de `status`, `env`/`exec` añaden copias con los nombres que leen las apps:
+  `SUPABASE_URL`, `{NEXT_PUBLIC,VITE,PUBLIC,EXPO_PUBLIC}_SUPABASE_URL` y `…_ANON_KEY`, `…_PUBLISHABLE_KEY`,
+  `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_GRAPHQL_URL`, `NEXT_PUBLIC_SUPABASE_GRAPHQL_URL`,
+  `SUPABASE_JWT_SECRET`, `SUPABASE_DB_URL` (solo si la variable de origen existe).
+  `LEASE_SUPABASE_ALIASES='NEXT_PUBLIC_GRAPHQL_URL=GRAPHQL_URL,DATABASE_URL=DB_URL'` añade o redefine alias
+  (`NOMBRE=ORIGEN`, origen = un nombre de `supabase status -o env`); `LEASE_SUPABASE_DEFAULT_ALIASES=0` deja solo los tuyos.
+  `exec -- supabase …` no recibe los alias (son para la app, no para el CLI).
+- `LEASE_SUPABASE_OVERRIDE_NAMES=api.url=MY_URL,…` renombra variables de `status` (lo pasa a `supabase status --override-name`). Renombra, no duplica: para tener dos nombres usa alias.
 
 ### Limitaciones conocidas
 
 - **Todo comando `supabase` tiene que ir por `lease-supabase exec`**. Un `supabase db reset` a pelo usa el project_id del config, o sea el stack sin gestionar en los puertos por defecto. Es el riesgo principal y el snippet de CLAUDE.md insiste en ello.
-- Si el proyecto tiene URLs/puertos fijos en `.env*`, el entorno del proceso tiene que ganar. Next.js, Vite y dotenv no sobrescriben variables ya definidas, pero hay que usar los mismos nombres (ver `OVERRIDE_NAMES`).
+- Si el proyecto tiene URLs/puertos fijos en `.env*`, el entorno del proceso tiene que ganar. Next.js, Vite y dotenv no sobrescriben variables ya definidas, pero hay que usar los mismos nombres (ver alias).
 - Mientras siga vivo un stack sin gestionar en los puertos por defecto, el slot 0 choca con él. Desplaza los slots para todos los agentes a la vez con
   `lease resource-meta supabase --set '{"slot_offset":1}'` (slot 0 → +100), o migra ese stack a un slot. La configuración vive en la DB compartida, así que todos usan los mismos `port_step`/`slot_offset`. Las variables `LEASE_SUPABASE_PORT_STEP`/`SLOT_OFFSET` la sobrescriben solo para un proceso.
 - La BD de un slot se comparte entre worktrees del mismo repo (volúmenes por repo × slot). Los datos de prueba de uno pueden verlos otros hasta que haya un reset. Los volúmenes se acumulan como mucho repos × slots; `down --purge` los borra.
@@ -363,6 +426,7 @@ los volúmenes.
 - Un lease caducado pero no reclamado por nadie se **revive** en el siguiente renew de su dueño. Es a propósito: nadie lo tenía.
 - El hook solo renueva por actividad del agente. Un agente más de 15 min sin tool calls puede perder el lease, pero solo si en ese rato otro necesita el slot.
 - Un agente colgado pero vivo retiene su slot hasta que alguien lo necesite.
+- Un `hold` (o `lease-supabase exec`) retiene el slot mientras viva su comando: un `pnpm dev` olvidado lo bloquea indefinidamente (con capacidad 1, a todos). BUSY y `lease ls` muestran qué comando es, para poder pararlo.
 - `capacity` menor que los slots ocupados no expulsa a nadie: esos slots se marcan `held*` hasta que se liberen.
 - El holder fallback (`pid:host:pid:cwd`) cambia con cada shell. Fuera de Claude/Orca, fija `LEASE_HOLDER`.
 

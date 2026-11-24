@@ -61,7 +61,10 @@ test_busy() {
   as A acquire db >/dev/null
   local err; err=$(as B acquire db 2>&1 >/dev/null); local r=$?
   eq $r 2 "busy exit code"
-  has "$err" "BUSY db"; has "$err" "slot 0: A"
+  has "$err" "BUSY db: 1/1 slots held"; has "$err" "slot 0: A"
+  has "$err" "lease wait db"; has "$err" "do not raise it yourself"
+  as X capacity db 2 >/dev/null; as B acquire db >/dev/null
+  err=$(as C acquire db 2>&1 >/dev/null); has "$err" "BUSY db: 2/2 slots held"
 }
 
 test_idempotent_same_holder() {
@@ -247,6 +250,59 @@ test_hold_cmd_and_lost() {
   wait $h; eq $? 3 "hold exits 3 on LOST"
 }
 
+test_hold_records_command() {
+  as A acquire db >/dev/null
+  LEASE_HOLDER=A LEASE_PID=0 "$LEASE" hold db --interval 1s -- sleep 3 & local h=$!
+  sleep 1
+  has "$(LEASE_TOP_PANELS= "$LEASE" top --once)" "running: sleep 3" "top shows it"
+  has "$(q "SELECT meta FROM leases")" '"holds":{' "hold recorded in meta"
+  has "$(as B acquire db 2>&1)" "running: sleep 3 (pid " "BUSY shows what holds it"
+  wait $h
+  eq "$(q "SELECT json_extract(meta,'\$.holds') FROM leases")" "{}" "cleared when the command ends"
+  case "$(as B acquire db 2>&1)" in *running:*) bad "no command after hold ended";; esac
+}
+
+test_hold_lost_kills_the_tree() {
+  as A acquire db >/dev/null
+  local mark="$TMP/grandchild-$$"
+  # a wrapper whose real work runs in a grandchild (like pnpm → next dev)
+  LEASE_HOLDER=A LEASE_PID=0 "$LEASE" hold db --interval 1s -- \
+    sh -c "sh -c 'sleep 30; touch $mark' & wait" & local h=$!
+  sleep 1.5
+  q "DELETE FROM leases"
+  wait $h; eq $? 3 "exit 3 on LOST"
+  sleep 0.5
+  pgrep -f "sleep 30; touch $mark" >/dev/null && bad "grandchild survived the LOST"
+  pkill -f "sleep 30; touch $mark" 2>/dev/null; true
+}
+
+test_notify_on_reap() {
+  local orca="$TMP/orca-stub" calls="$TMP/orca-calls"
+  cat > "$orca" <<STUB
+#!/bin/bash
+echo "\$*" >> "$calls"
+[ "\$1 \$2" = "terminal list" ] && echo '{"ok":true,"result":{"terminals":[{"handle":"term_other","tabId":"T9","leafId":"P9"},{"handle":"term_x","tabId":"T1","leafId":"P1"}]}}'
+exit 0
+STUB
+  chmod +x "$orca"; : > "$calls"
+  export LEASE_ORCA_BIN=$orca
+  as orca:T1:P1 acquire db --ttl 1s >/dev/null
+  sleep 2
+  as B acquire db >/dev/null; eq $? 0 "B steals the expired lease"
+  local i=0; while [ $i -lt 30 ] && ! grep -q 'orchestration send' "$calls"; do sleep 0.2; i=$((i+1)); done
+  grep -q -- '--to term_x ' "$calls" || { bad "previous holder not notified"; cat "$calls"; }
+  has "$(cat "$calls")" "you LOST db slot 0"
+  # dead agents (why=pid) and non-Orca holders are not notified; LEASE_NOTIFY=0 disables
+  : > "$calls"; as B release db >/dev/null
+  as plain acquire db --ttl 1s >/dev/null; sleep 2; as C acquire db >/dev/null; sleep 1
+  grep -q 'orchestration send' "$calls" && bad "non-orca holder notified"
+  as C release db >/dev/null; : > "$calls"
+  as orca:T1:P1 acquire db --ttl 1s >/dev/null; sleep 2
+  LEASE_NOTIFY=0 as D acquire db >/dev/null; sleep 1
+  [ -s "$calls" ] && bad "LEASE_NOTIFY=0 must not call orca"
+  unset LEASE_ORCA_BIN
+}
+
 test_renew_mine() {
   sleep 300 & local me=$!
   sleep 300 & local other=$!
@@ -425,11 +481,13 @@ grep -qx "$p" "$FAKE/busy"
 STUB
   cat > "$FAKE/bin/supabase" <<'STUB'
 #!/bin/bash
-echo "supabase $* | pid=${SUPABASE_PROJECT_ID-} api=${SUPABASE_API_PORT-} db=${SUPABASE_DB_PORT-} net=${SUPABASE_NETWORK_ID-} cwd=$PWD" >> "$FAKE/calls"
+echo "supabase $* | pid=${SUPABASE_PROJECT_ID-} api=${SUPABASE_API_PORT-} db=${SUPABASE_DB_PORT-} net=${SUPABASE_NETWORK_ID-} cwd=$PWD jwt=${SUPABASE_AUTH_JWT_SECRET-} url=${SUPABASE_URL-}" >> "$FAKE/calls"
 case "$1" in
   start)  printf '%s\t%s\n' "$SUPABASE_PROJECT_ID" "$PWD" >> "$FAKE/running"; touch "$FAKE/vol_supabase_db_$SUPABASE_PROJECT_ID";;
   stop)   grep -v "^$3	" "$FAKE/running" > "$FAKE/r.tmp"; mv "$FAKE/r.tmp" "$FAKE/running";;
-  status) echo "API_URL=\"http://127.0.0.1:$SUPABASE_API_PORT\""; echo 'ANON_KEY="k e y"';;
+  status) echo "API_URL=\"http://127.0.0.1:$SUPABASE_API_PORT\""; echo 'ANON_KEY="k e y"'
+          echo "GRAPHQL_URL=\"http://127.0.0.1:$SUPABASE_API_PORT/graphql/v1\""
+          echo "JWT_SECRET=\"${SUPABASE_AUTH_JWT_SECRET:-demo-secret}\"";;
 esac
 exit 0
 STUB
@@ -575,6 +633,76 @@ test_sb_env_exec_down() {
   grep -q 'supabase stop --project-id toy_lease0 --no-backup' "$FAKE/calls" || bad "down --purge deletes volumes"
   eq "$(rc as A token supabase)" 3 "released"
   eq "$(rc sbx down)" 3 "down without lease -> 3"
+}
+
+test_sb_per_project_jwt() {
+  sb_setup jwt
+  local want; want=$(printf 'lease-supabase:toy_lease0' | shasum -a 256 | cut -c1-64)
+  sbx up >/dev/null 2>&1                                   # fresh volumes
+  grep -q "supabase start .*jwt=$want" "$FAKE/calls" || { bad "fresh stack not started with the per-project secret"; cat "$FAKE/calls"; }
+  has "$(sbx env)" "export SUPABASE_AUTH_JWT_SECRET=$want"
+  has "$(sbx env)" "export JWT_SECRET=$want" "status (keys) computed with it"
+  # another repo on the same slot gets another secret
+  [ "$(printf 'lease-supabase:other_lease0' | shasum -a 256 | cut -c1-64)" != "$want" ] || bad "secrets must differ"
+  sbx down --stop >/dev/null; : > "$FAKE/calls"
+  sbx up >/dev/null 2>&1                                   # warm restart: same secret
+  grep -q "supabase start .*jwt=$want" "$FAKE/calls" || bad "restart keeps the secret"
+  sbx down >/dev/null
+  # volumes that predate per-project keys keep the CLI default, with a note
+  sb_setup jwt-legacy
+  q "DELETE FROM slots"
+  touch "$FAKE/vol_supabase_db_toy_lease0"
+  local out; out=$(sbx up 2>&1)
+  has "$out" "shared demo JWT secret"
+  grep -q 'supabase start .*jwt= ' "$FAKE/calls" || bad "legacy volumes must keep the default secret"
+  case "$(sbx env)" in *SUPABASE_AUTH_JWT_SECRET*) bad "legacy: no secret in env";; esac
+  sbx down >/dev/null
+  # opt-out, and a secret set by the project itself, win
+  sb_setup jwt-off
+  LEASE_SUPABASE_PER_PROJECT_JWT=0 sbx up >/dev/null 2>&1
+  grep -q 'supabase start .*jwt= ' "$FAKE/calls" || bad "opt-out"
+  sbx down --purge >/dev/null
+  printf '[auth]\njwt_secret = "env(MY_SECRET)"\n' >> "$PROJ/supabase/config.toml"; : > "$FAKE/calls"
+  sbx up >/dev/null 2>&1
+  grep -q 'supabase start .*jwt= ' "$FAKE/calls" || bad "config.toml jwt_secret must win"
+}
+
+test_sb_aliases() {
+  sb_setup aliases
+  sbx up >/dev/null 2>&1
+  local d; d=$(sbx env --dotenv)
+  has "$d" 'NEXT_PUBLIC_SUPABASE_URL="http://127.0.0.1:60000"'
+  has "$d" 'SUPABASE_URL="http://127.0.0.1:60000"'
+  has "$d" 'VITE_SUPABASE_ANON_KEY="k e y"'
+  has "$d" 'NEXT_PUBLIC_SUPABASE_GRAPHQL_URL="http://127.0.0.1:60000/graphql/v1"'
+  case "$d" in *PUBLISHABLE*) bad "no alias when the source is missing";; esac
+  d=$(LEASE_SUPABASE_ALIASES='NEXT_PUBLIC_GRAPHQL_URL=GRAPHQL_URL,SUPABASE_URL=GRAPHQL_URL' sbx env --dotenv)
+  has "$d" 'NEXT_PUBLIC_GRAPHQL_URL="http://127.0.0.1:60000/graphql/v1"' "custom alias"
+  eq "$(printf '%s\n' "$d" | grep -c '^SUPABASE_URL=')" 1 "one SUPABASE_URL"
+  has "$d" 'SUPABASE_URL="http://127.0.0.1:60000/graphql/v1"' "user alias redefines a default"
+  d=$(LEASE_SUPABASE_DEFAULT_ALIASES=0 sbx env --dotenv)
+  case "$d" in *NEXT_PUBLIC*) bad "defaults off";; esac
+  eq "$(sbx exec -- sh -c 'echo $NEXT_PUBLIC_SUPABASE_URL')" "http://127.0.0.1:60000" "exec exports aliases"
+  : > "$FAKE/calls"; sbx exec -- supabase migration up >/dev/null
+  grep -q 'supabase migration up .*url= *$' "$FAKE/calls" || { bad "the supabase CLI must not get app aliases"; cat "$FAKE/calls"; }
+}
+
+test_sb_exec_holds() {
+  sb_setup hold
+  sbx up --ttl 2s >/dev/null 2>&1
+  sbx exec -- sleep 4 & local e=$!
+  sleep 3
+  has "$(q "SELECT meta FROM leases")" '"holds":{' "exec runs under hold"
+  eq "$(rc as B acquire supabase)" 2 "renewed past its 2s ttl while the command runs"
+  wait $e; eq $? 0 "exit code passes through"
+  eq "$(sbx exec -- sh -c 'exit 5'; echo $?)" 5 "non-zero exit code passes through"
+  # down stops what runs through exec
+  sbx exec -- sleep 30 & e=$!
+  sleep 1.5; sbx down >/dev/null
+  wait $e; eq $? 3 "exec'd command stopped (exit 3) when the slot is released"
+  # --no-hold: plain exec
+  sbx up >/dev/null 2>&1
+  eq "$(sbx exec --no-hold -- sh -c 'echo $SUPABASE_PROJECT_ID')" toy_lease0 "--no-hold"
 }
 
 test_sb_panel() {

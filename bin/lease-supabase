@@ -105,6 +105,26 @@ slot_env() {
     for v in $vars; do echo "$v=$((base + off))"; done
   done <<<"$PORTS"
   echo "LEASE_SUPABASE_SLOT=$k"
+  [ "$(jwt_mode "$k")" = lease ] && echo "SUPABASE_AUTH_JWT_SECRET=$(jwt_secret "${BASE_ID}_lease$k")"
+}
+
+# Per-project JWT secret. With the CLI's shared demo secret, an app left
+# pointing at a slot that another repo took over keeps working against the
+# wrong database; with a secret per project id its tokens get a 401 instead.
+# Deterministic (same project id → same secret), so warm restarts and kept
+# volumes keep working. Not a real secret: this is local development.
+jwt_secret() { printf 'lease-supabase:%s' "$1" | shasum -a 256 | cut -c1-64; }
+
+# jwt_mode <slot>: "lease" (per-project secret) or "default" (the CLI's own).
+# Only stacks whose volumes were created with the per-project secret use it:
+# switching the secret under existing volumes is not something to do quietly.
+# JWT_MODE_OVERRIDE is set by `up` when it is about to create fresh volumes.
+jwt_mode() {
+  if [ "${LEASE_SUPABASE_PER_PROJECT_JWT:-1}" = 0 ] || [ -n "$(toml_get auth jwt_secret)" ] ||
+     [ -n "$(toml_get auth signing_keys_path)" ]; then echo default; return; fi
+  if [ -n "${JWT_MODE_OVERRIDE-}" ]; then echo "$JWT_MODE_OVERRIDE"; return; fi
+  local m; m=$(json_get "$(slot_meta_get "$1")" "db.\"${BASE_ID}_lease$1\".jwt")
+  echo "${m:-default}"
 }
 
 slot_project() { echo "${BASE_ID}_lease$1"; }
@@ -176,8 +196,11 @@ usage:
                                         --purge also deletes its volumes)
   lease-supabase status                 slots, who holds them, what runs where
   lease-supabase env [--dotenv|--json]  env for the slot you hold (overrides + URLs/keys)
-  lease-supabase exec -- <cmd...>       run cmd with the slot env (e.g. supabase db reset,
-                                        pnpm test). A bare `supabase` uses the project's CLI.
+  lease-supabase exec [--no-hold] -- <cmd...>
+                                        run cmd with the slot env (e.g. supabase db reset,
+                                        pnpm test, pnpm dev). A bare `supabase` uses the
+                                        project's CLI. Renews the slot while cmd runs and
+                                        stops cmd if the slot is lost (--no-hold: neither).
   lease-supabase ports [<slot>]         port map of a slot
   lease-supabase panel                  summary used by `lease top`
 
@@ -185,6 +208,8 @@ slot k: project_id <config project_id>_lease<k>, ports = config ports + k*100
 env: LEASE_SUPABASE_RESOURCE (supabase) LEASE_SUPABASE_PORT_STEP (100)
      LEASE_SUPABASE_SLOT_OFFSET (0) — or shared: lease resource-meta supabase --set '{"port_step":100,"slot_offset":1}' LEASE_SUPABASE_NETWORK (lease-supabase; '' = off)
      LEASE_SUPABASE_SUBNET LEASE_SUPABASE_BIN LEASE_SUPABASE_OVERRIDE_NAMES
+     LEASE_SUPABASE_ALIASES (NAME=SOURCE,…; e.g. NEXT_PUBLIC_GRAPHQL_URL=GRAPHQL_URL)
+     LEASE_SUPABASE_DEFAULT_ALIASES (1; 0 = only yours) LEASE_SUPABASE_PER_PROJECT_JWT (1)
 exit codes: as lease (2 busy, 3 LOST, 4 timeout) + 1 error
 EOF
 }
@@ -214,7 +239,10 @@ cmd_up() {
   [ -n "$ttl" ] && acq+=(--ttl "$ttl")
   if [ "$wait" = 1 ]; then out=$("$LEASE" wait "$RES" --timeout "$timeout" "${acq[@]}"); rc=$?
   else out=$("$LEASE" acquire "$RES" "${acq[@]}"); rc=$?; fi
-  [ $rc -eq 0 ] || exit $rc
+  if [ $rc -ne 0 ]; then
+    [ $rc -eq "$EX_BUSY" ] && say "hint: lease-supabase up --wait   (queues up to --timeout, default 30m)"
+    exit $rc
+  fi
   local slot=${out#* } pid
   pid=$(slot_project "$slot")
   "$LEASE" meta "$RES" --set "{\"project_id\":\"$pid\",\"slot\":$slot}" >/dev/null
@@ -253,6 +281,16 @@ hint: stop it yourself if it is yours, or shift slots with LEASE_SUPABASE_SLOT_O
   # 3. Start (or reuse) our stack.
   local fresh=0
   docker volume inspect "supabase_db_$pid" >/dev/null 2>&1 || fresh=1
+  [ "$fresh" = 1 ] && JWT_MODE_OVERRIDE=lease
+  local jwt; jwt=$(jwt_mode "$slot")
+  if [ "$jwt" = default ] && [ "$fresh" = 0 ] && [ "$(JWT_MODE_OVERRIDE=lease jwt_mode "$slot")" = lease ]; then
+    say "note: $pid uses the CLI's shared demo JWT secret (volumes predate per-project keys)."
+    say "  to switch: lease-supabase down --purge && lease-supabase up   (deletes this slot's data)"
+  fi
+  # record it before starting: the volumes are created with this secret even
+  # if the start fails halfway
+  [ "$fresh" = 1 ] && "$LEASE" slot-meta "$RES" "$slot" --set "$(sqlite3 :memory: \
+    "SELECT json_object('db', json_object($(sqlq "$pid"), json_object('jwt', $(sqlq "$jwt"))));")" >/dev/null
   if [ "$mine_running" = 1 ]; then
     say "stack $pid already running from this worktree — reusing it"
   else
@@ -299,7 +337,8 @@ hint: stop it yourself if it is yours, or shift slots with LEASE_SUPABASE_SLOT_O
       'project_id', $(sqlq "$pid"), 'slot', $slot,
       'started_at', strftime('%Y-%m-%dT%H:%M:%S','now','localtime'),
       'db', json_object($(sqlq "$pid"), json_object('migrations_hash', $(sqlq "$db_hash"),
-                                                  'worktree', $(sqlq "$db_wt")))));")
+                                                  'worktree', $(sqlq "$db_wt"),
+                                                  'jwt', $(sqlq "$jwt")))));")
   "$LEASE" slot-meta "$RES" "$slot" --set "$smeta_new" >/dev/null || say "warning: could not record slot meta (lease LOST?)"
 
   echo "slot=$slot project_id=$pid"
@@ -338,7 +377,38 @@ collect_env() {
   if [ -n "${LEASE_SUPABASE_OVERRIDE_NAMES-}" ]; then
     for n in $(echo "$LEASE_SUPABASE_OVERRIDE_NAMES" | tr ',' ' '); do args+=(--override-name "$n"); done
   fi
-  sb "$slot" "${args[@]}" 2>/dev/null | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/^\([^=]*\)="\(.*\)"$/\1=\2/'
+  local st; st=$(sb "$slot" "${args[@]}" 2>/dev/null | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/^\([^=]*\)="\(.*\)"$/\1=\2/')
+  printf '%s\n' "$st"
+  [ "${NO_ALIASES-}" = 1 ] || aliases "$st"
+}
+
+# The names apps actually read, copied from `supabase status -o env`. Exported
+# through `exec`, they win over the app's .env files (Next.js and Vite never
+# overwrite variables already in the environment).
+DEFAULT_ALIASES='SUPABASE_URL=API_URL NEXT_PUBLIC_SUPABASE_URL=API_URL VITE_SUPABASE_URL=API_URL
+PUBLIC_SUPABASE_URL=API_URL EXPO_PUBLIC_SUPABASE_URL=API_URL
+SUPABASE_ANON_KEY=ANON_KEY NEXT_PUBLIC_SUPABASE_ANON_KEY=ANON_KEY VITE_SUPABASE_ANON_KEY=ANON_KEY
+PUBLIC_SUPABASE_ANON_KEY=ANON_KEY EXPO_PUBLIC_SUPABASE_ANON_KEY=ANON_KEY
+SUPABASE_PUBLISHABLE_KEY=PUBLISHABLE_KEY NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=PUBLISHABLE_KEY
+VITE_SUPABASE_PUBLISHABLE_KEY=PUBLISHABLE_KEY PUBLIC_SUPABASE_PUBLISHABLE_KEY=PUBLISHABLE_KEY
+SUPABASE_SERVICE_ROLE_KEY=SERVICE_ROLE_KEY SUPABASE_SECRET_KEY=SECRET_KEY
+SUPABASE_GRAPHQL_URL=GRAPHQL_URL NEXT_PUBLIC_SUPABASE_GRAPHQL_URL=GRAPHQL_URL
+SUPABASE_JWT_SECRET=JWT_SECRET SUPABASE_DB_URL=DB_URL'
+
+# aliases <status lines>: NAME=value for every alias whose source exists.
+# LEASE_SUPABASE_ALIASES adds (or redefines) aliases: "NAME=SOURCE,..." —
+# e.g. NEXT_PUBLIC_GRAPHQL_URL=GRAPHQL_URL,DATABASE_URL=DB_URL.
+# LEASE_SUPABASE_DEFAULT_ALIASES=0 drops the defaults.
+aliases() {
+  local list='' a name src v
+  [ "${LEASE_SUPABASE_DEFAULT_ALIASES:-1}" = 0 ] || list=$DEFAULT_ALIASES
+  list="$list $(printf '%s' "${LEASE_SUPABASE_ALIASES-}" | tr ',' ' ')"
+  for a in $list; do
+    name=${a%%=*} src=${a#*=}
+    case "$name" in ''|*[!A-Za-z0-9_]*|[0-9]*) say "warning: bad alias '$a' ignored"; continue;; esac
+    v=$(printf '%s\n' "$1" | awk -v k="$src" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }')
+    [ -n "$v" ] && echo "$name=$v"
+  done | awk -F= '{ last[$1] = NR; line[NR] = $0 } END { for (i = 1; i <= NR; i++) if (last[substr(line[i], 1, index(line[i], "=") - 1)] == i) print line[i] }'
 }
 
 cmd_env() {
@@ -353,14 +423,28 @@ cmd_env() {
   esac
 }
 
+# exec runs cmd under `lease hold`: the slot is renewed while cmd lives (a dev
+# server keeps it even if the agent goes quiet), and if the lease is lost
+# anyway (released with `down`, or the agent died and someone took it) cmd is
+# stopped instead of silently talking to another project's stack.
 cmd_exec() {
-  [ "${1-}" = -- ] && shift
-  [ $# -gt 0 ] || die "usage: lease-supabase exec -- <cmd...>"
+  local hold=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-hold) hold=0; shift;;
+      --) shift; break;;
+      *) break;;
+    esac
+  done
+  [ $# -gt 0 ] || die "usage: lease-supabase exec [--no-hold] -- <cmd...>"
+  # app aliases (SUPABASE_URL…) are for apps; keep them away from the CLI
+  [ "$1" = supabase ] && NO_ALIASES=1
   local lines; lines=$(collect_env) || exit $?
   load_project
   local envs=() l
   while IFS= read -r l; do [ -n "$l" ] && envs+=("$l"); done <<<"$lines"
   if [ "$1" = supabase ]; then shift; set -- "$SB" "$@"; fi
+  [ "$hold" = 1 ] && set -- "$LEASE" hold "$RES" -- "$@"
   exec env "${envs[@]}" "$@"
 }
 
